@@ -2,6 +2,8 @@ import pandapower as pp
 import pandapower.networks as ppn
 import numpy as np
 import gurobipy as grb
+from sklearn.linear_model import OrthogonalMatchingPursuit
+from sklearn.decomposition import FastICA
 from pandas import Series
 
 class AnomalyModels():
@@ -37,13 +39,23 @@ class AnomalyModels():
         - H, a matrix that is derived from the grid under study
         - z, generated measurements *for a single time step* that 
           are to be perturbed
-        - k, the element of a for which a specific perturbation is desired
-        - delta, the desired perturbation to a[k]
+        - fixed: a {index:value} dictionary of the indexes of the target
+                 vector the adversary wants to change and by how much. Note that
+                 when the 'targeted' key is present, the first element of the
+                 (c) vector (i.e. index 0) cannot be modified.
         - a_bounds, (lower, upper) bounds for elements of a
         - c_bounds, (lower, upper) bounds for elements of c
 
+        It may also include the following:
+        - targeted, if included, changes the target from measurements to
+          state variables. This means that k and delta will be used with
+          the c vector instead (with constraints changed accordingly). The
+          return value remains unchanged.
+
         Common variables include:
         - a, the attack vector
+        - a_positive and a_negative, components of a used as a workaround for
+          the solver not supporting abs()
         - c, the effect of the adjustment of a on the state
         Common constraints include:
         - a[k] = delta;
@@ -51,7 +63,7 @@ class AnomalyModels():
         - c_bounds[0] <= c[i] <= c_bounds[1] for all i in [0, H.shape(1)[
 
         Additional variables/constraints may be included as follows:
-        - 'secure' is a variable that can be added to const_kwargs which
+        - secure is a variable that can be added to const_kwargs which
           should contain a list of integers indicating which measurements the
           adversary cannot access.
         - var_decls is a function that when given a grb.Model and const_kwargs, 
@@ -60,7 +72,7 @@ class AnomalyModels():
           are made available for the purpose of creating additional constraints
         - objective gives a function that denotes the target and type of objective.
 
-        The function returns a vector of pertubations that can then be added to measurements of choice.
+        The function returns a vector of perturbations that can then be added to measurements of choice.
         """
         m = grb.Model(model_description)
         cvs = const_kwargs
@@ -68,19 +80,42 @@ class AnomalyModels():
         vs = var_decls(m, cvs)
         a = vs["a"] = [m.addVar(name=f"a{i}") for i in range(cvs["H"].shape[0])]
         c = vs["c"] = [m.addVar(name=f"c{i}") for i in range(cvs["H"].shape[1])]
-        vs["k"] = cvs["k"]
-        vs["delta"] = cvs["delta"]
+        vs["a_positive"] = [m.addVar(lb=0.0, name='a_pos%d' % i) for i in range(cvs["H"].shape[0])] 
+        vs["a_negative"] = [m.addVar(ub=0.0, name='a_neg%d' % i) for i in range(cvs["H"].shape[0])]
+
+        # Workaround for the solver not supporting abs()
+        for i in range(0, cvs["H"].shape[0]):
+            m.addConstr(a[i] == vs["a_positive"][i] + vs["a_negative"][i])
 
         target = "a"
         if "targeted" in cvs: # Target the state rather than the measurement
             target = "c"
+            # The first state variable is normally expected to be 0, so ignore
+            # if the user wanted to change it
+            if 0 in cvs["fixed"].keys():
+                del cvs["fixed"][0]
 
-        print(target, cvs["k"], cvs["delta"])
-        m.addConstr(vs[target][cvs["k"]] == cvs["delta"])
+        # default:  a[k] == delta
+        # targeted: c[k] == delta
+        for k, delta in cvs["fixed"].items():
+            m.addConstr(vs[target][k] == delta)
+
+
+        adef = lambda i: a[i] == (cvs["H"] @ c)[i] # Second constraint
+        if "targeted" in cvs:
+            I_fixed = [0] + list(sorted(cvs["fixed"].keys()))
+            I_free = [i for i in range(0, cvs["H"].shape[1]) if i not in I_fixed]
+            H_s = cvs["H"][:, I_free]
+            H_s_transpose = np.transpose(H_s)
+            B_s = H_s @ np.linalg.inv(H_s_transpose @ H_s) @ H_s_transpose - np.eye(H_s.shape[0])
+            c_aux = [c[i] for i in I_fixed]
+            
+            adef = lambda i: np.matmul(B_s, a)[i] == (B_s @ cvs["H"][:, I_fixed] @ c_aux)[i]
         
-        # a == H*c
+        # default:  a = H*c
+        # targeted: B_s * a = y
         for i in range(0, cvs["H"].shape[0]):
-            m.addConstr(a[i] == np.matmul(cvs["H"], c)[i])
+            m.addConstr(adef(i))
 
         def _add_Constr_for(m, lst, bounds, _from, _to):
             for i in range(_from, _to):
@@ -96,7 +131,9 @@ class AnomalyModels():
 
         # Inaccessible nodes (optional)
         if "secure" in cvs:
+            fixed = cvs["fixed"].keys() if "fixed" in cvs else []
             for si in cvs["secure"]:
+                assert si not in fixed # adversary wants to affect a value they cannot
                 m.addConstr(vs[target][si] == 0)
 
         # Additional, optional constraints
@@ -127,19 +164,12 @@ class AnomalyModels():
         """
         See least_effort_general for the expected contents of const_kwargs.
         """
-        model_description = "Least effort with norm 1"
+        model_description = const_kwargs.pop("description", "Least effort with norm 1")
 
-        def var_decls(m, cvs):
-            return {
-                # Absolute values cannot be used with the solver, so this is a workaround
-                "a_positive": [m.addVar(lb=0.0,name='a_pos%d' % i) for i in range(cvs["H"].shape[0])], 
-                "a_negative": [m.addVar(ub=0.0,name='a_neg%d' % i) for i in range(cvs["H"].shape[0])]
-                }
+        def var_decls(_m, _cvs):
+            return {}
 
         def constraints(m, _cvs, vs):
-            for i in range(0, _cvs["H"].shape[0]):
-                m.addConstr(vs["a"][i] == vs["a_positive"][i] + vs["a_negative"][i])
-
             m.addConstr(sum(ab[0]-ab[1] for ab in zip(vs["a_positive"], vs["a_negative"])) >= 1e-1)
 
         objective = (lambda vs: sum(ab[0]-ab[1] for ab in zip(vs["a_positive"], vs["a_negative"])), grb.GRB.MINIMIZE)
@@ -164,16 +194,13 @@ class AnomalyModels():
         def var_decls(m, cvs):
             return { 
                 "y": [m.addVar(vtype=grb.GRB.BINARY, name='y%d' % i) for i in range(cvs["H"].shape[0])],
-                "a_positive": [m.addVar(lb=0.0,name='a_pos%d' % i) for i in range(cvs["H"].shape[0])], 
-                "a_negative": [m.addVar(ub=0.0,name='a_neg%d' % i) for i in range(cvs["H"].shape[0])]
                 }
-    
+
         # -y[i]*M <= a[i] <= y[i]*M
         def constraints(m, _cvs, vs):
             for i in range(0, _cvs["H"].shape[0]):
                 m.addConstr(vs["a"][i] <= vs["y"][i] * const_kwargs["M"])
                 m.addConstr(vs["a"][i] >= -vs["y"][i] * const_kwargs["M"])
-                m.addConstr(vs["a"][i] == vs["a_positive"][i] + vs["a_negative"][i])
                 
             m.addConstr(sum(vs["y"]) >= 1)
             m.addConstr(sum(ab[0]-ab[1] for ab in zip(vs["a_positive"], vs["a_negative"])) >= 1e-1)
@@ -185,15 +212,93 @@ class AnomalyModels():
         )
         return least_effort_a_big_M 
 
-    def targeted_attack(**const_kwargs):
+    def targeted_least_effort_norm_1(**const_kwargs):
         """
-        WIP.
-        The expected contents for const_kwargs are the same as in least_effort_big_M.
+        See least_effort_general for the expected contents of const_kwargs.
+        The expected keys are the same as in least_effort_norm_1.
         """
         const_kwargs["targeted"] = True
-        const_kwargs["description"] = "Targeted attack"
-        targeted_attack_a = AnomalyModels.least_effort_big_m(const_kwargs["M"], **const_kwargs)
-        return targeted_attack_a
+        const_kwargs["description"] = "Targeted least effort with norm 1"
+        return AnomalyModels.least_effort_norm_1(**const_kwargs)
+
+    def targeted_least_effort_big_m(**const_kwargs):
+        """
+        See least_effort_big_m for the expected contents of const_kwargs.
+        """
+        const_kwargs["targeted"] = True
+        const_kwargs["description"] = "Targeted least effort with big-M"
+        return AnomalyModels.least_effort_big_m(**const_kwargs)  
+
+    def targeted_matching_pursuit(**const_kwargs):
+        """
+        Implemented using the Orthogonal Matching Pursuit algorithm.
+        Required keys in const_kwargs:
+        - H: a matrix derived from the grid under study
+        - fixed: a {index:value} dictionary of the components of the state
+                 vector c the adversary wants to change and by how much. Note that
+                 the first state variable (index 0) cannot be modified.
+
+        Note that this 
+        """
+        cvs = const_kwargs
+        
+        I = list(range(0, cvs["H"].shape[1]))
+        I_fixed = [0] + [i for i in sorted(cvs["fixed"].keys()) if i != 0]
+        I_free = [i for i in I if i not in I_fixed]
+
+        H_s = cvs["H"][:, I_free]
+        H_s_transpose = np.transpose(H_s)
+        B_s = H_s @ np.linalg.inv(H_s_transpose @ H_s) @ H_s_transpose - np.eye(H_s.shape[0])
+        c = np.zeros((cvs["H"].shape[1],))
+        for i in I_fixed[1:]:
+            c[i] = cvs["fixed"][i]
+        y = B_s @ cvs["H"][:, I_fixed] @ c[I_fixed]
+
+        H_t = np.transpose(cvs["H"][:, 1:])
+        possible_as = [] # [(# of non-zero elements, a)]
+        for n in range(1, cvs["H"].shape[0] + 1):
+            # Bs*a=y, solve for a where cardinality(a) = n_nonzero_coefs
+            omp = OrthogonalMatchingPursuit(n_nonzero_coefs=n, normalize=False)
+            omp.fit(B_s, y)
+            a = omp.coef_
+            # a = H*c => c = (H^T * H)^(-1) * H^T * a
+            resulting_c = np.linalg.inv(H_t @ cvs["H"][:, 1:]) @ H_t @ a
+            resulting_c = np.hstack((0, resulting_c))
+            #print((c[I_fixed] - resulting_c[I_fixed]).reshape(-1, 1))
+            if np.abs(np.max(c[I_fixed] - resulting_c[I_fixed])) < 1e-4:
+                break
+            possible_as.append((n, a))
+
+        return possible_as
+
+    def modal_decomposition(z_t, error_tolerance=1e-4):
+        """
+        WIP.
+        Uses Individual Component Analysis (ICA) to attempt to create an
+        injection vector. Only measurements for a single time step is used;
+        hence, the return value is not the injection vector itself but rather
+        the (now perturbed) input measurements.
+
+        If the attack is deemed infeasible, False is returned.
+
+        Required parameters:
+        z_t: measurements for a single time step, as a column vector (e.g. z[:, 1])
+        """
+        z = z_t.reshape((-1, 1))
+        ica = FastICA(n_components=None, random_state=0,whiten='unit-variance', fun='logcosh')
+        y = ica.fit_transform(z)
+        G = ica.mixing_
+
+        # Check for feasibility
+        assert np.max(np.abs(z - (np.dot(y, G.T) + ica.mean_))) > error_tolerance
+
+        sigma_2 = 0.00001 # to be revisited
+        mean = np.zeros(y.shape[0])
+        cov = np.eye(y.shape[0]) * sigma_2
+        delta_y = np.random.multivariate_normal(mean, cov).reshape((-1, 1))
+        z_perturbed = z + np.dot(y + delta_y, G.T) + ica.mean_
+
+        return z_perturbed
 
     def random_matrix(**cvs):
         """
