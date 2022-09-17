@@ -90,8 +90,9 @@ class AnomalyModels():
         # ... <= a[i] <= ...
         _add_Constr_for(m, a, cvs["a_bounds"], 0, cvs["H"].shape[0])
 
-        # ... <= c[i] <= ...    
-        _add_Constr_for(m, c, cvs["c_bounds"], 0, cvs["H"].shape[1])
+        # ... <= c[i] <= ...
+        m.addConstr(vs["c"][0] == 0) # todo: determine whether this should stay (perhaps targeted only?)   
+        _add_Constr_for(m, c, cvs["c_bounds"], 1, cvs["H"].shape[1])
 
         # Inaccessible nodes (optional)
         if "secure" in cvs:
@@ -135,7 +136,12 @@ class AnomalyModels():
                 "a_negative": [m.addVar(ub=0.0,name='a_neg%d' % i) for i in range(cvs["H"].shape[0])]
                 }
 
-        constraints = None
+        def constraints(m, _cvs, vs):
+            for i in range(0, _cvs["H"].shape[0]):
+                m.addConstr(vs["a"][i] == vs["a_positive"][i] + vs["a_negative"][i])
+
+            m.addConstr(sum(ab[0]-ab[1] for ab in zip(vs["a_positive"], vs["a_negative"])) >= 1e-1)
+
         objective = (lambda vs: sum(ab[0]-ab[1] for ab in zip(vs["a_positive"], vs["a_negative"])), grb.GRB.MINIMIZE)
         
         a = AnomalyModels.least_effort_general(
@@ -157,7 +163,9 @@ class AnomalyModels():
 
         def var_decls(m, cvs):
             return { 
-                "y": [m.addVar(vtype=grb.GRB.BINARY, name='y%d' % i) for i in range(cvs["H"].shape[0])]
+                "y": [m.addVar(vtype=grb.GRB.BINARY, name='y%d' % i) for i in range(cvs["H"].shape[0])],
+                "a_positive": [m.addVar(lb=0.0,name='a_pos%d' % i) for i in range(cvs["H"].shape[0])], 
+                "a_negative": [m.addVar(ub=0.0,name='a_neg%d' % i) for i in range(cvs["H"].shape[0])]
                 }
     
         # -y[i]*M <= a[i] <= y[i]*M
@@ -165,6 +173,10 @@ class AnomalyModels():
             for i in range(0, _cvs["H"].shape[0]):
                 m.addConstr(vs["a"][i] <= vs["y"][i] * const_kwargs["M"])
                 m.addConstr(vs["a"][i] >= -vs["y"][i] * const_kwargs["M"])
+                m.addConstr(vs["a"][i] == vs["a_positive"][i] + vs["a_negative"][i])
+                
+            m.addConstr(sum(vs["y"]) >= 1)
+            m.addConstr(sum(ab[0]-ab[1] for ab in zip(vs["a_positive"], vs["a_negative"])) >= 1e-1)
 
         objective = (lambda vs: sum(vs["y"]), grb.GRB.MINIMIZE)
 
@@ -185,16 +197,47 @@ class AnomalyModels():
 
     def random_matrix(**cvs):
         """
-        WIP
+        Attempts to compute an injection vector a that aims to tamper with a
+        specific state variable, with reduced knowledge about the grid
+        (i.e. the adversary only has access to the dimensions of H).
+
+        Required parameters:
+        - H, a matrix that is derived from the grid under study.
+             Note that only the dimensions of H are used.
+        - T, the max size of the rolling window (e.g. 4*cvs["H"].shape[1])
+        - Z, a matrix of measurements for n time stepssuch that n > T
+        - k, the index of the state variable of interest
+        - delta, the desired perturbation
         """
-        # T: rolling window
-        # [z1, z2, ... z10] t = 11
-        # [z2, ..., z11]    t = 12
-        u, _s, _v = np.linalg.svd(cvs["Z"]) # where Z is a subset of the input measurements according to the rolling window
-        c = np.zeros((H.shape[1], 1))  # constant
+
+        T = 40 * cvs["H"].shape[1] # Default value
+        if "T" in cvs:
+            T = cvs["T"] 
+
+        # Ensure there are enough measurements
+        assert cvs["t"] > T 
+        assert cvs["Z"].shape[1] >= cvs["t"]
+
+        # Grab the T most recent sets of measurements
+        Z = cvs["Z"][:, cvs["t"] - T: cvs["t"]]
+
+
+        Z_bar = np.mean(Z, axis=1) / (Z.shape[1] - 1)
+
+        lst = []
+        for i in range(Z.shape[1]):
+            lst.append(np.outer(Z[:, i] - Z_bar, Z[:, i] - Z_bar))
+        
+        cov = sum(lst) / (Z.shape[1] - 1)
+
+        u, _s, _v = np.linalg.svd(cov)
+        c = np.zeros((cvs["H"].shape[1], 1))  # constant
         c[cvs["k"]] = cvs["delta"]
-        a = u @ c # for a single time t
-        return a
+        
+        a = u[:, :cvs["H"].shape[1]] @ c # for a single time t
+
+        # a is a vector of single-element vectors
+        return a.reshape(-1)
 
 
 
@@ -207,8 +250,8 @@ class PowerGrid():
     # constants. They are set through the given input parameters.
     network            = None # 'network_id'
     H                  = None # 'network_id'
-    measurement_factor = 1/10 # 'measurement_factor', optional
-    noise_factor       = 1/10 # 'noise_factor', optional
+    measurement_factor = 1/5000 # 'measurement_factor', optional
+    noise_factor       = 1/500 # 'noise_factor', optional
     anomaly_threshold  = 3    # 'anomaly_threshold', optional
     
     # These variables are updated (and overwritten) upon calling the given
@@ -310,7 +353,7 @@ class PowerGrid():
             mean = np.zeros(p_mw.shape) * self.measurement_factor
             self.cov = np.eye(p_mw.shape[0])    
             for t in range(1, T):
-                delta_load = np.random.multivariate_normal(mean, cov)
+                delta_load = np.random.multivariate_normal(mean, self.cov)
                 p_mw.add(Series(delta_load)) 
                 pp.rundcpp(self.network)
                 x_t = x_temp.to_numpy().reshape((x_t.shape[0], -1))
@@ -405,46 +448,3 @@ class PowerGrid():
             return getattr(self, default_key)
         setattr(self, default_key, arg)
         return arg
-
-if __name__ == "__main__":
-    np.set_printoptions(edgeitems=10, linewidth=180)
-
-    print("Testing: case 14")
-    net = PowerGrid(14) # Alternative arguments: "IEEE-14", "14"
-    z = net.create_measurements(1, 1) # 'x' measurements using data strategy 'y'
-    z = z.repeat(3, axis=1) # Keep three versions of the same array
-    z_before = np.copy(z)
-    print(f"Created measurements {z.shape} with strategy 1:", z, sep="\n")
-
-    # Introduce anomalies to the last two time steps using the least-effort model
-    config = {
-        "H": net.H,
-        "z": None,
-        "k": 1,  # tamper with 2nd measurement
-        "delta": None, # alter by an absolute amount
-        "a_bounds": None, # (lower, upper)
-        "c_bounds": None  # (lower, upper)
-    }
-    x_est_pure = net.estimate_state(z)
-    config["z"] = z[:, 1]
-    config["delta"] = 3 #abs(z[config["k"], 1]) * 0.2
-    config["a_bounds"] = (-100, 100)
-    config["c_bounds"] = (-100, 100)
-    a = AnomalyModels.least_effort_norm_1(**config)
-    print("Attack vector:")
-    print(a.transpose())
-    z[:,1] += a.transpose()
-    print(z)
-
-    # Naively try to tamper with the last time step
-    a = np.zeros(z[:, 1].shape)
-    a[4] = abs(z[1, 2]) * 0.2
-    z[:, 2] += a
-
-    x_est = net.estimate_state(z) # Arguments can be provided to override stored values
-    print("Estimated state:", x_est, x_est.shape, sep="\n")
-    r = net.calculate_normalized_residuals()
-    print("Normalized residuals:", r, r.shape, sep="\n")
-    anomalies = net.check_for_anomalies()
-    print("Anomalies:", [(i, r[i[0], i[1]]) for i in anomalies])
-    print(len(anomalies))
