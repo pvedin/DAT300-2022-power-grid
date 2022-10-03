@@ -13,16 +13,21 @@ class AnomalyModels():
     z_a = z + a
 
     Available models include:
-        - least_effort: the aim is to successfully alter a specific measurement
-                        such that it involves minimal "effort".
+        - least_effort: the aim is to successfully alter a measurement
+                        such that it involves minimal "effort"
             - least_effort_norm_1: aims to minimize the total deviation from natural measurements
             - least_effort_big_m: aims to minimize the number of nodes by minimizing
                                     the number of nodes whose non-zero individual measurements
                                     are within +- M
-        - targeted_attack: Similar to least_effort_big_m, but aims to create a specific
-                            change in the state variables rather than in the measurements.
+        - small_ubiquitous: aim to alter a measurement such that the magnitude of
+                            other needed perturbations are minimized, at the expense of
+                            requiring more such perturbations
+        - targeted_*: variants of some models that aim to induce a specific change
+                      in the state vector rather than the measurements.
+        
         - modal_decomposition: todo
-        - random_matrix: todo
+        - random_matrix: aims to alter a measurement while only knowing the
+                         dimensions of the H matrix and previous measurements
 
     Parameters are generally passed through a {name: value} dictionary;
     see the comments for each model for more information.
@@ -71,17 +76,20 @@ class AnomalyModels():
         - constraints is a function where the model, const_kwargs, and var_decls 
           are made available for the purpose of creating additional constraints
         - objective gives a function that denotes the target and type of objective.
+        - silence is an attribute which, if present, will stop Gurobi from printing
+          to the console. This includes the "Infeasible model!" error message.
 
         The function returns a vector of perturbations that can then be added to measurements of choice.
+        A zero vector will be returned if the input model is found to be infeasible.
         """
         m = grb.Model(model_description)
         cvs = const_kwargs
 
         vs = var_decls(m, cvs)
-        a = vs["a"] = [m.addVar(name=f"a{i}") for i in range(cvs["H"].shape[0])]
-        c = vs["c"] = [m.addVar(name=f"c{i}") for i in range(cvs["H"].shape[1])]
+        a = vs["a"] = [m.addVar(lb=-grb.GRB.INFINITY, name=f"a{i}") for i in range(cvs["H"].shape[0])]
+        c = vs["c"] = [m.addVar(lb=-grb.GRB.INFINITY, name=f"c{i}") for i in range(cvs["H"].shape[1])]
         vs["a_positive"] = [m.addVar(lb=0.0, name='a_pos%d' % i) for i in range(cvs["H"].shape[0])] 
-        vs["a_negative"] = [m.addVar(ub=0.0, name='a_neg%d' % i) for i in range(cvs["H"].shape[0])]
+        vs["a_negative"] = [m.addVar(lb=-grb.GRB.INFINITY, ub=0.0, name='a_neg%d' % i) for i in range(cvs["H"].shape[0])]
 
         # Workaround for the solver not supporting abs()
         for i in range(0, cvs["H"].shape[0]):
@@ -141,6 +149,9 @@ class AnomalyModels():
             constraints(m, cvs, vs)
 
         m.setObjective(objective[0](vs), objective[1])
+
+        if "silence" in cvs:
+            grb.setParam("OutputFlag", False)
         
         m.update()
         m.optimize()
@@ -148,13 +159,16 @@ class AnomalyModels():
         # Extract elements of a
         try:
             least_effort_a = [v.x for v in m.getVars() if v.VarName in [f"a{i}" for i in range(cvs["H"].shape[0])]]
-        except AttributeError: # Infeasible model
-            return False
+        except AttributeError:
+            # Infeasible model, so return zero vector
+            if "silence" not in cvs:
+                print("Infeasible model!")
+            return np.zeros([cvs["H"].shape[1], 1])
 
         # a for a single point in time
         least_effort_a = np.asarray(least_effort_a)
 
-        # Since the gurobi solver appears to be deterministic with regards to
+        # Since the Gurobi solver appears to be deterministic with regards to
         # the final answer it returns, running it once for every time step 
         # would be inefficient. Hence the user is expected to add the 
         # resulting vector to measurements of their choosing.
@@ -237,8 +251,6 @@ class AnomalyModels():
         - fixed: a {index:value} dictionary of the components of the state
                  vector c the adversary wants to change and by how much. Note that
                  the first state variable (index 0) cannot be modified.
-
-        Note that this 
         """
         cvs = const_kwargs
         
@@ -264,12 +276,59 @@ class AnomalyModels():
             # a = H*c => c = (H^T * H)^(-1) * H^T * a
             resulting_c = np.linalg.inv(H_t @ cvs["H"][:, 1:]) @ H_t @ a
             resulting_c = np.hstack((0, resulting_c))
-            #print((c[I_fixed] - resulting_c[I_fixed]).reshape(-1, 1))
-            if np.abs(np.max(c[I_fixed] - resulting_c[I_fixed])) < 1e-4:
+
+            # Reject zero vectors
+            if np.max(np.abs(c[I_fixed] - resulting_c[I_fixed])) < 1e-4:
                 break
             possible_as.append((n, a))
 
         return possible_as
+
+    def small_ubiquitous(**const_kwargs):
+        """
+        See least_effort_general for the expected contents of const_kwargs.
+        """
+        model_description = "Small ubiquitous injection"
+
+        def var_decls(_m, _cvs):
+            return {}
+
+        def constraints(m, _cvs, vs):
+            pass
+
+        # Minimize norm-2 (note that gurobi does not support square roots)
+        objective = (lambda vs: sum(map(lambda x: x**2, vs["a"])), grb.GRB.MINIMIZE)
+        
+        a = AnomalyModels.least_effort_general(
+            model_description, var_decls, constraints, objective, **const_kwargs
+        )
+
+        return a
+
+    def targeted_small_ubiquitous(**cvs):
+        """
+        Required keys in cvs:
+        - H: a matrix derived from the grid under study
+        - fixed: a {index:value} dictionary of the components of the state
+                 vector c the adversary wants to change and by how much. Note that
+                 the first state variable (index 0) cannot be modified.
+        """
+        
+        I_fixed = [0] + list(sorted(cvs["fixed"].keys()))
+        I_free = [i for i in range(0, cvs["H"].shape[1]) if i not in I_fixed]
+        H_s = cvs["H"][:, I_free]
+        H_s_transpose = np.transpose(H_s)
+        B_s = H_s @ np.linalg.inv(H_s_transpose @ H_s) @ H_s_transpose - np.eye(H_s.shape[0])
+        c = np.zeros((cvs["H"].shape[1],))
+        for i in I_fixed[1:]:
+            c[i] = cvs["fixed"][i]
+        y = B_s @ cvs["H"][:, I_fixed] @ c[I_fixed]
+
+        bsr = np.linalg.matrix_rank(B_s)
+        u,s,v = np.linalg.svd(B_s)
+        a = v[:, 0:bsr] @ np.linalg.inv(np.diag(s[0:bsr])) 
+        a = a @ u[:, 0:bsr].transpose() @ y
+        return a
 
     def modal_decomposition(z_t, error_tolerance=1e-4):
         """
@@ -290,7 +349,7 @@ class AnomalyModels():
         G = ica.mixing_
 
         # Check for feasibility
-        assert np.max(np.abs(z - (np.dot(y, G.T) + ica.mean_))) > error_tolerance
+        assert np.max(np.abs(z - (np.dot(y, G.T) + ica.mean_))) < error_tolerance
 
         sigma_2 = 0.00001 # to be revisited
         mean = np.zeros(y.shape[0])
@@ -311,9 +370,12 @@ class AnomalyModels():
              Note that only the dimensions of H are used.
         - T, the max size of the rolling window (e.g. 4*cvs["H"].shape[1])
         - Z, a matrix of measurements for n time stepssuch that n > T
-        - k, the index of the state variable of interest
-        - delta, the desired perturbation
+        - fixed: a {index:value} dictionary of the components of the state
+                 vector c the adversary wants to change and by how much. Note that
+                 the first state variable (index 0) cannot be modified.
         """
+
+        cvs["fixed"][0] = 0
 
         T = 40 * cvs["H"].shape[1] # Default value
         if "T" in cvs:
@@ -337,13 +399,13 @@ class AnomalyModels():
 
         u, _s, _v = np.linalg.svd(cov)
         c = np.zeros((cvs["H"].shape[1], 1))  # constant
-        c[cvs["k"]] = cvs["delta"]
+        for k, delta in cvs["fixed"].items():
+            c[k] = delta
         
         a = u[:, :cvs["H"].shape[1]] @ c # for a single time t
 
         # a is a vector of single-element vectors
         return a.reshape(-1)
-
 
 
 class PowerGrid():
@@ -427,7 +489,7 @@ class PowerGrid():
             self.anomaly_threshold = anomaly_threshold
         
 
-    def create_measurements(self, T, data_generation_strategy):
+    def create_measurements(self, T, data_generation_strategy, env_noise=True):
         """
         Generates T measurements according to
             z = H*x + n
@@ -436,6 +498,9 @@ class PowerGrid():
         noise.
 
         The argument data_generation_strategy can be either 1 or 2.
+
+        env_noise will omit the noise added to each measurement if set to
+        False; however, the noise added to the state vectors remains unchanged.
 
         Returns a [X x T] numpy array -- where X is the number of measurements
         for each time step -- which is also stored in self.z_buffer.
@@ -447,7 +512,7 @@ class PowerGrid():
             # Dx ~ N(0,Cov_Mat)
             mean = np.zeros(x_base.shape)
             self.cov = np.eye(x_base.shape[0]) * self.measurement_factor
-            delta_x_mat = np.transpose(np.random.multivariate_normal(mean, self.cov, size=T))
+            delta_x_mat = np.transpose(np.random.multivariate_normal(mean, self.cov**2, size=T))
             x_base_mat = np.repeat(x_base.reshape((x_base.shape[0], -1)), T, axis=1)
             x_t_mat = x_base_mat + delta_x_mat
 
@@ -458,7 +523,7 @@ class PowerGrid():
             mean = np.zeros(p_mw.shape) * self.measurement_factor
             self.cov = np.eye(p_mw.shape[0])    
             for t in range(1, T):
-                delta_load = np.random.multivariate_normal(mean, self.cov)
+                delta_load = np.random.multivariate_normal(mean, self.cov**2)
                 p_mw.add(Series(delta_load)) 
                 pp.rundcpp(self.network)
                 x_t = x_temp.to_numpy().reshape((x_t.shape[0], -1))
@@ -468,12 +533,13 @@ class PowerGrid():
 
         self.data_generation_strategy = data_generation_strategy
 
-        #z_t = H @ x_t + noise
+        #z_t = H @ x_t + noise, where @ is infix for np.matmul
         mean = np.zeros(self.H.shape[0])
         self.cov_noise = np.eye(self.H.shape[0]) * self.noise_factor
         noise_mat = np.transpose(np.random.multivariate_normal(mean, self.cov_noise, size=T))
-        z_t_mat = self.H @ x_t_mat + noise_mat # @ is infix for np.matmul()
-        self.z_buffer = z_t_mat
+        z_t_mat = self.H @ x_t_mat
+        if env_noise:
+            self.z_buffer = z_t_mat + noise_mat
         return z_t_mat
 
     def estimate_state(self, z=None):
@@ -529,12 +595,12 @@ class PowerGrid():
         anomalous_indexes = []
 
         # Only iterate through the matrix if an anomaly is present
-        if r.max() > self.anomaly_threshold:
+        if max([r.max(), abs(r.min())]) > self.anomaly_threshold:
             with np.nditer(r, flags=["multi_index"]) as it:
                 for value in it:
-                    if value > self.anomaly_threshold:
-                        i, j = it.multi_index
-                        anomalous_indexes.append((i,j))
+                    if abs(value) > self.anomaly_threshold:
+                        index, timestep = it.multi_index
+                        anomalous_indexes.append((index, timestep))
                     
         return anomalous_indexes
 
