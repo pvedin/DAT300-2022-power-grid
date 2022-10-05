@@ -1,4 +1,4 @@
-from powergrid import *
+from powergrid_dc import *
 from itertools import chain, combinations
 from random import uniform, randint, sample
 
