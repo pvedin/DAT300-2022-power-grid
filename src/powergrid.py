@@ -1,10 +1,13 @@
+print("Loading libraries...")
 import pandapower as pp
 import pandapower.networks as ppn
 import numpy as np
-import gurobipy as grb
+import pyomo.environ as pyo
 from sklearn.linear_model import OrthogonalMatchingPursuit
 from sklearn.decomposition import FastICA
 from pandas import Series
+from scipy import sparse
+print("Loaded!")
 
 class AnomalyModels():
     """
@@ -33,10 +36,9 @@ class AnomalyModels():
     see the comments for each model for more information.
     """
 
-    def least_effort_general(model_description,
-                             var_decls=lambda m, cvs: {"e", m.addVar(name='example')},
-                             constraints=lambda m, cvs, vs: m.addConstr(vs["a"][1] == 1),
-                             objective=(lambda vs: sum(vs["y"]), grb.GRB.MINIMIZE),
+    def least_effort_general(var_decls=lambda m, cvs: {},
+                             constraints=lambda m, cvs: None,
+                             objective=(lambda m: None, pyo.minimize),
                              **const_kwargs):
         """
         Contains common code for different variants of the least effort model.
@@ -82,18 +84,21 @@ class AnomalyModels():
         The function returns a vector of perturbations that can then be added to measurements of choice.
         A zero vector will be returned if the input model is found to be infeasible.
         """
-        m = grb.Model(model_description)
+        m = pyo.ConcreteModel()
         cvs = const_kwargs
 
         vs = var_decls(m, cvs)
-        a = vs["a"] = [m.addVar(lb=-grb.GRB.INFINITY, name=f"a{i}") for i in range(cvs["H"].shape[0])]
-        c = vs["c"] = [m.addVar(lb=-grb.GRB.INFINITY, name=f"c{i}") for i in range(cvs["H"].shape[1])]
-        vs["a_positive"] = [m.addVar(lb=0.0, name='a_pos%d' % i) for i in range(cvs["H"].shape[0])] 
-        vs["a_negative"] = [m.addVar(lb=-grb.GRB.INFINITY, ub=0.0, name='a_neg%d' % i) for i in range(cvs["H"].shape[0])]
+        m.a_num = range(cvs["H"].shape[0])
+        m.c_num = range(cvs["H"].shape[1])
+        m.a = vs["a"] = pyo.Var(m.a_num, domain=pyo.Reals, bounds=cvs["a_bounds"], initialize=0)
+        m.c = vs["c"] = pyo.Var(m.c_num, domain=pyo.Reals, bounds=cvs["c_bounds"], initialize=0)
+        m.a_pos = vs["a_pos"] = pyo.Var(m.a_num, domain=pyo.NonNegativeReals, initialize=0)
+        m.a_neg = vs["a_neg"] = pyo.Var(m.a_num, domain=pyo.NonPositiveReals, initialize=0)
 
         # Workaround for the solver not supporting abs()
-        for i in range(0, cvs["H"].shape[0]):
-            m.addConstr(a[i] == vs["a_positive"][i] + vs["a_negative"][i])
+        m.abs_a = pyo.ConstraintList()
+        for i in m.a_num:
+            m.abs_a.add(m.a[i] == m.a_pos[i] + m.a_neg[i]) 
 
         target = "a"
         if "targeted" in cvs: # Target the state rather than the measurement
@@ -105,60 +110,53 @@ class AnomalyModels():
 
         # default:  a[k] == delta
         # targeted: c[k] == delta
+        m.targets = pyo.ConstraintList()
         for k, delta in cvs["fixed"].items():
-            m.addConstr(vs[target][k] == delta)
+            m.targets.add(vs[target][k] == delta)
 
-
-        adef = lambda i: a[i] == (cvs["H"] @ c)[i] # Second constraint
+        print(type(cvs["H"]), type(m.c))
+        adef = lambda i: m.a[i] == (cvs["H"].todense() @ m.c)[i] # Second constraint
         if "targeted" in cvs:
             I_fixed = [0] + list(sorted(cvs["fixed"].keys()))
             I_free = [i for i in range(0, cvs["H"].shape[1]) if i not in I_fixed]
             H_s = cvs["H"][:, I_free]
             H_s_transpose = np.transpose(H_s)
             B_s = H_s @ np.linalg.inv(H_s_transpose @ H_s) @ H_s_transpose - np.eye(H_s.shape[0])
-            c_aux = [c[i] for i in I_fixed]
+            c_aux = [m.c[i] for i in I_fixed]
             
-            adef = lambda i: np.matmul(B_s, a)[i] == (B_s @ cvs["H"][:, I_fixed] @ c_aux)[i]
+            adef = lambda i: np.matmul(B_s, m.a)[i] == (B_s @ cvs["H"][:, I_fixed] @ c_aux)[i]
         
         # default:  a = H*c
         # targeted: B_s * a = y
+        m.injection_constraint = pyo.ConstraintList()
         for i in range(0, cvs["H"].shape[0]):
-            m.addConstr(adef(i))
+            m.injection_constraint.add(adef(i))
 
-        def _add_Constr_for(m, lst, bounds, _from, _to):
-            for i in range(_from, _to):
-                m.addConstr(lst[i] >= bounds[0])
-                m.addConstr(lst[i] <= bounds[1])
-
-        # ... <= a[i] <= ...
-        _add_Constr_for(m, a, cvs["a_bounds"], 0, cvs["H"].shape[0])
-
-        # ... <= c[i] <= ...
-        m.addConstr(vs["c"][0] == 0) # todo: determine whether this should stay (perhaps targeted only?)   
-        _add_Constr_for(m, c, cvs["c_bounds"], 1, cvs["H"].shape[1])
+        m.inaccessible = pyo.ConstraintList()
+        m.inaccessible.add(m.c[0] == 0)
 
         # Inaccessible nodes (optional)
         if "secure" in cvs:
             fixed = cvs["fixed"].keys() if "fixed" in cvs else []
             for si in cvs["secure"]:
                 assert si not in fixed # adversary wants to affect a value they cannot
-                m.addConstr(vs[target][si] == 0)
+                m.inaccessible.add(vs[target][si] == 0)
 
         # Additional, optional constraints
         if constraints:
-            constraints(m, cvs, vs)
+            constraints(m, cvs)
 
-        m.setObjective(objective[0](vs), objective[1])
+        m.value = pyo.Objective(rule=objective[0], sense=objective[1])
 
-        if "silence" in cvs:
-            grb.setParam("OutputFlag", False)
+        output_flag = "silence" not in cvs
         
-        m.update()
-        m.optimize()
+        # Use the Gurobi solver
+        optimizer = pyo.SolverFactory("gurobi")
+        status_opti = optimizer.solve(m, tee=output_flag)
 
         # Extract elements of a
         try:
-            least_effort_a = [v.x for v in m.getVars() if v.VarName in [f"a{i}" for i in range(cvs["H"].shape[0])]]
+            least_effort_a = [pyo.value(m.a[i]) for i in m.a_num]
         except AttributeError:
             # Infeasible model, so return zero vector
             if "silence" not in cvs:
@@ -168,28 +166,22 @@ class AnomalyModels():
         # a for a single point in time
         least_effort_a = np.asarray(least_effort_a)
 
-        # Since the Gurobi solver appears to be deterministic with regards to
-        # the final answer it returns, running it once for every time step 
-        # would be inefficient. Hence the user is expected to add the 
-        # resulting vector to measurements of their choosing.
         return least_effort_a
 
     def least_effort_norm_1(**const_kwargs):
         """
         See least_effort_general for the expected contents of const_kwargs.
         """
-        model_description = const_kwargs.pop("description", "Least effort with norm 1")
 
-        def var_decls(_m, _cvs):
-            return {}
+        def constraints(m, _cvs):
+            m.nonzero_a = pyo.Constraint(expr = sum(m.a_pos[i] - m.a_neg[i] for i in m.a_num) >= 1e-1)
 
-        def constraints(m, _cvs, vs):
-            m.addConstr(sum(ab[0]-ab[1] for ab in zip(vs["a_positive"], vs["a_negative"])) >= 1e-1)
-
-        objective = (lambda vs: sum(ab[0]-ab[1] for ab in zip(vs["a_positive"], vs["a_negative"])), grb.GRB.MINIMIZE)
+        objective = (lambda m: sum(m.a_pos[i] - m.a_neg[i] for i in m.a_num), pyo.minimize)
         
         a = AnomalyModels.least_effort_general(
-            model_description, var_decls, constraints, objective, **const_kwargs
+            constraints = constraints, 
+            objective = objective, 
+            **const_kwargs
         )
 
         return a
@@ -202,27 +194,29 @@ class AnomalyModels():
         also dependent on binary values, where there is one such value for 
         each measurement and the sum of which is the target of minimization.
         """
-
-        model_description = const_kwargs.pop("description", "Least effort with big-M")
+        ys = const_kwargs["H"].shape[0]
 
         def var_decls(m, cvs):
-            return { 
-                "y": [m.addVar(vtype=grb.GRB.BINARY, name='y%d' % i) for i in range(cvs["H"].shape[0])],
-                }
+            vs = {}
+            m.y = vs["y"] = pyo.Var(range(cvs["H"].shape[0]), domain=pyo.Binary, initialize=0)
+            return vs
+            
 
         # -y[i]*M <= a[i] <= y[i]*M
-        def constraints(m, _cvs, vs):
-            for i in range(0, _cvs["H"].shape[0]):
-                m.addConstr(vs["a"][i] <= vs["y"][i] * const_kwargs["M"])
-                m.addConstr(vs["a"][i] >= -vs["y"][i] * const_kwargs["M"])
+        def constraints(m, _cvs):
+            m.bigM_bounds = pyo.ConstraintList()
+            
+            for i in range(0, ys):
+                m.bigM_bounds.add(m.a[i] <= m.y[i] * _cvs["M"])
+                m.bigM_bounds.add(m.a[i] >= -m.y[i] * _cvs["M"])
                 
-            m.addConstr(sum(vs["y"]) >= 1)
-            m.addConstr(sum(ab[0]-ab[1] for ab in zip(vs["a_positive"], vs["a_negative"])) >= 1e-1)
+            m.nonzero_y = pyo.Constraint(expr = sum(m.y[i] for i in range(ys)) >= 1)
+            m.nonzero_a = pyo.Constraint(expr = sum(m.a_pos[i] - m.a_neg[i] for i in m.a_num) >= 1e-1)
 
-        objective = (lambda vs: sum(vs["y"]), grb.GRB.MINIMIZE)
+        objective = (lambda m: sum(m.y[i] for i in range(ys)), pyo.minimize)
 
         least_effort_a_big_M = AnomalyModels.least_effort_general(
-            model_description, var_decls, constraints, objective, **const_kwargs
+            var_decls, constraints, objective, **const_kwargs
         )
         return least_effort_a_big_M 
 
@@ -288,19 +282,12 @@ class AnomalyModels():
         """
         See least_effort_general for the expected contents of const_kwargs.
         """
-        model_description = "Small ubiquitous injection"
-
-        def var_decls(_m, _cvs):
-            return {}
-
-        def constraints(m, _cvs, vs):
-            pass
-
         # Minimize norm-2 (note that gurobi does not support square roots)
-        objective = (lambda vs: sum(map(lambda x: x**2, vs["a"])), grb.GRB.MINIMIZE)
+        objective = (lambda m: sum(map(lambda x: x**2, (m.a[i] for i in m.a_num))), pyo.minimize)
         
         a = AnomalyModels.least_effort_general(
-            model_description, var_decls, constraints, objective, **const_kwargs
+            objective = objective, 
+            **const_kwargs
         )
 
         return a
@@ -417,8 +404,8 @@ class PowerGrid():
     # constants. They are set through the given input parameters.
     network            = None # 'network_id'
     H                  = None # 'network_id'
-    measurement_factor = 1/5000 # 'measurement_factor', optional
-    noise_factor       = 1/500 # 'noise_factor', optional
+    measurement_factor = 1e-4 # 'measurement_factor', optional
+    noise_factor       = 1e-3 # 'noise_factor', optional
     anomaly_threshold  = 3    # 'anomaly_threshold', optional
     
     # These variables are updated (and overwritten) upon calling the given
@@ -432,20 +419,34 @@ class PowerGrid():
     def __init__(self, network_id, measurement_factor=None, noise_factor=None, 
                  anomaly_threshold=None):
         """
-        Available networks include "IEEE-X", where X is one of [14, 30, 57, 118].
+        Available networks include:
+        - "IEEE X", where X is one of [14, 30, 57, 118];
+        - "Illinois 200", or simply 200;
+        - "PEGASE 1354", or 1354;
+        - "RTE 2848", or 2848;
+
         The selected network will be loaded and stored in self.network.
         """
+
+        accepted_prefixes = ["IEEE ", "Illinois ", "PEGASE ", "RTE "]
         if type(network_id) == type(int()):
             network_id = str(network_id)
-        elif "IEEE-" in network_id: # Since all (currently) supported networks have the same prefix
-            network_id = network_id[network_id.index("IEEE-")+5:]
+        else:
+            prefix = list(p for p in accepted_prefixes if p in network_id)
+            if prefix:
+                prefix = prefix[0]
+                network_id = network_id[network_id.index(prefix)+len(prefix):]
 
         cases = {
             "14": ppn.case14,
             "30": ppn.case30,
             "57": ppn.case57,
             "118": ppn.case118,
+            "200": ppn.case_illinois200,
+            "1354": ppn.case1354pegase,
+            "2848": ppn.case2848rte,
         }
+
         if not network_id in cases:
             raise NotImplementedError(f"Unsupported network configuration: {network_id}")
 
@@ -481,6 +482,8 @@ class PowerGrid():
                 self.H[i, from_j] = power_flow
                 self.H[i, to_j]  = -power_flow
 
+        self.H = sparse.csr_matrix(self.H)
+
         if noise_factor:
             self.noise_factor = noise_factor
         if measurement_factor:
@@ -505,7 +508,7 @@ class PowerGrid():
         Returns a [X x T] numpy array -- where X is the number of measurements
         for each time step -- which is also stored in self.z_buffer.
         """
-        x_temp = self.network.res_bus.va_degree
+        x_temp = self.network.res_bus.va_degree * (np.pi / 180) # Store in radians
         if data_generation_strategy == 1:
             # state vector x_base
             x_base = x_temp.to_numpy()
@@ -537,6 +540,7 @@ class PowerGrid():
         mean = np.zeros(self.H.shape[0])
         self.cov_noise = np.eye(self.H.shape[0]) * self.noise_factor
         noise_mat = np.transpose(np.random.multivariate_normal(mean, self.cov_noise, size=T))
+        self.W = np.linalg.inv(self.cov_noise**2) # Used in estimate_state()
         z_t_mat = self.H @ x_t_mat
         if env_noise:
             self.z_buffer = z_t_mat + noise_mat
@@ -546,17 +550,19 @@ class PowerGrid():
         """
         Calculates state estimations based on the given network configuration
         and observed measurements according to:
-            x_est = (H_est_transpose * H_est)^-1 * H_est_transpose * z
-        where H_est is equal to H with the exception that the first column
+            x_est = (H_est_transpose * W * H_est)^-1 * H_est_transpose * z
+        where W[i,i] = 1/sigma**2 and H_est is equal to H with the exception that the first column
         is removed (under the assumption that the remaining state variables
         x[1:, :] are relative to x[0, :]).
         """
         z = self._load_var("z_buffer", z, err_msg="Cannot estimate state without measurements.")
 
-        H_est = np.copy(self.H[:, 1:])
+        H_est = self.H[:, 1:].copy()
         H_est_transpose = np.transpose(H_est)
-        print(H_est.shape, z.shape)
-        self.x_est = np.linalg.inv(H_est_transpose @ H_est) @ H_est_transpose @ z
+
+        # If H was a numpy array:
+        # self.x_est = np.linalg.inv(H_est_transpose @ self.W @ H_est) @ H_est_transpose @ self.W @ z
+        self.x_est = sparse.linalg.spsolve(H_est_transpose @ self.W @ H_est, H_est_transpose @ self.W @ z)
 
         # Prepend zeroes as the first measurement, since the latter ones are
         # measured relative to it.
@@ -578,7 +584,17 @@ class PowerGrid():
         x_hat = self._load_var("x_est", x_est, err_msg + "x_est")
 
         r = z - self.H @ x_hat
-        self.residuals_normalized = r / np.sqrt(self.cov_noise[0, 0]) # check if abs(measurement)>3
+        
+        # If e ~ N(0, self.cov_noise**2), then normalized_residuals ~ N(0, omega)
+        Ht = np.transpose(self.H[:,1:])
+        omega = self.cov_noise**2 - self.H[:,1:] @ np.linalg.inv(Ht @ self.W @ self.H[:,1:]) @ Ht
+        self.residuals_normalized = []
+        for i in range(0, r.shape[1]):
+            v = np.abs(r[:,i]) / np.sqrt(np.abs(np.diag(omega)))
+            self.residuals_normalized.append(v)
+        
+        self.residuals_normalized = np.asarray(self.residuals_normalized)
+
         return self.residuals_normalized
 
     def check_for_anomalies(self, residuals_normalized=None):
@@ -594,10 +610,12 @@ class PowerGrid():
 
         anomalous_indexes = []
 
-        # Only iterate through the matrix if an anomaly is present
-        if max([r.max(), abs(r.min())]) > self.anomaly_threshold:
-            with np.nditer(r, flags=["multi_index"]) as it:
-                for value in it:
+        # Find all anomalous values
+        with np.nditer(r, flags=["multi_index"]) as it:
+            for value in it:
+                if not np.isinf(value):
+                    # nan values (i.e. 0/0) are handled by the fact that
+                    # any comparison with a nan will return False
                     if abs(value) > self.anomaly_threshold:
                         index, timestep = it.multi_index
                         anomalous_indexes.append((index, timestep))
