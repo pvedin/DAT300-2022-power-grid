@@ -10,7 +10,7 @@ def println(*args, **kwargs):
 def print_anomalies(net, r):
     anomalies = net.check_for_anomalies(r)
     # (row, col) == (measurement_index, timestamp)
-    println("Anomalies:", [(f"ts {i[1]} index {i[0]}", r[i[0], i[1]]) for i in anomalies])
+    println("Anomalies:", [(f"ts {i[0]} index {i[1]}", r[i[0], i[1]]) for i in anomalies])
     print(len(anomalies))
 
 def test_blueprint():
@@ -73,7 +73,7 @@ def test_norm_1():
 
     config = {
         "H": net.H,
-        "fixed": {1:-10},
+        "fixed": {2:5},
         "a_bounds": (-1000, 1000),
         "c_bounds": (-1000, 1000),
     }
@@ -83,14 +83,35 @@ def test_norm_1():
     z[:,5] += a
 
     a = np.zeros(z[:, 1].shape)
-    a[1] = abs(z[1, 6]) * 0.5
-    z[:, 6] += a
+    #a[1] = abs(z[2, 6]) * 0.1
+    z[2, 6] += 0.1
 
     x_est = net.estimate_state(z)
     println("x_est", x_est)
     r = net.calculate_normalized_residuals()
     
     println("Normalized residuals:", r, r.shape)
+    print_anomalies(net, r)
+
+def test_big_m():
+    print("Testing: least effort (big-M)")
+    net = PowerGrid(14)
+    z = net.create_measurements(1, 1)
+    z = z.repeat(3, axis=1)
+    config = {
+        "H": net.H,
+        "z": None,
+        "fixed": {1: 5},
+        "a_bounds": (-1000, 1000),
+        "c_bounds": (-1000, 1000),
+        "M": 1000
+    }
+    a1 = AnomalyModels.targeted_least_effort_big_m(**config)
+    z[:, 1] += a1
+    println("z", z)
+    x_est = net.estimate_state(z)
+    println("x_est:", x_est, x_est.shape)
+    r = net.calculate_normalized_residuals()
     print_anomalies(net, r)
 
 def test_targeted_norm_1():
@@ -346,12 +367,15 @@ def test_targeted_small_ubiquitous():
 if __name__ == "__main__":
     np.set_printoptions(edgeitems=10, linewidth=180)
 
-    #test_targeted_norm_1()
+    test_norm_1()
+    #test_big_m()
+    #test_targeted_least_effort()
+    #test_small_ubiquitous()
+    #test_targeted_small_ubiquitous()
     #test_matching_pursuit()
     #test_modal_decomposition()
     #test_random_matrix()
     #test_for_anomalies()
-    test_sensor_count()
-    #test_small_ubiquitous()
-    #test_targeted_small_ubiquitous()
+    #test_sensor_count()
+    
 
