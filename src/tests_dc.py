@@ -1,6 +1,7 @@
 from powergrid_dc import *
 from itertools import chain, combinations
 from random import uniform, randint, sample
+import matplotlib.pyplot as plt
 
 def println(*args, **kwargs):
     if "sep" in kwargs:
@@ -372,7 +373,13 @@ def test_targeted_small_ubiquitous():
 
 def test_OU():
     net = PowerGrid(14)
-    z = net.create_measurements(1,2)
+    z = net.create_measurements(100,2)
+    plt.plot(z.transpose())
+    x_ests = net.estimate_state()
+    r = net.calculate_normalized_residuals()
+    plt.figure()
+    plt.plot(np.max(np.abs(r.transpose()),axis=1))
+    plt.show()
 
 if __name__ == "__main__":
     np.set_printoptions(edgeitems=10, linewidth=180)

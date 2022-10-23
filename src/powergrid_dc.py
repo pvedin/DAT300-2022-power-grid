@@ -666,43 +666,42 @@ class PowerGrid():
             """
             Jesper Franke, "Short introduction to python", Potsdam Institute for Climate Impact Research
             https://www.pik-potsdam.de/members/franke/lecture-sose-2016/introduction-to-python.pdf
+
+            Experimental WIP. Has not been thoroughly tested.
             """
             
             x_t = x_temp.to_numpy()
             x_t_mat = x_t.reshape((x_t.shape[0], -1))
             p_mw_init = self.network.load.p_mw.values.copy()
 
-            
             if OU:
                 theta, mu, sigma = OU
             else:
                 # Comments based on article by Diego Barba (May 3, 2022)
                 # https://towardsdatascience.com/stochastic-processes-simulation-the-ornstein-uhlenbeck-process-e8bff820f3
-                theta = np.abs(np.random.normal(0.001, 0.01)) # mean-reversion
-                mu = 0 # asymptotic mean
-                sigma = np.abs(np.random.normal(0.005, 0.01)) # random scale
+                theta = np.abs(np.random.normal(0.01, 0.1)) # mean-reversion
+                mu = 0                                      # asymptotic mean
+                sigma = np.abs(np.random.normal(0.04, 0.1)) # random scale
 
             t = np.linspace(0, T, T)
             dt = np.mean(np.diff(t))
             y = np.zeros(T)
-            y[0] = p_mw_init[0] # ?
+            y[0] = 0.1
 
             drift = lambda y,t: theta * (mu - y)
             diffusion = lambda _y, _t: sigma
-            #noise = np.random.normal(loc=0, scale=1.0, size=T) * np.sqrt(dt)
-            noise = np.random.normal(0, self.state_noise_factor**2, T) * np.sqrt(dt)
+            noise = np.random.normal(0, 1, T) * np.sqrt(dt)
+            #noise = np.random.normal(0, self.state_noise_factor**2, T) * np.sqrt(dt)
 
             for i in range(1, T):
                 y[i] = y[i-1] + drift(y[i-1], i*dt)*dt + diffusion(y[i-1], i*dt) * noise[i]
 
-
-            OU_proc = np.asarray(OU_proc)
+            y = np.asarray(y)
             x_t_mat = []
             for t in range(T):
-                delta_load = p_mw_init * (1+OU_proc[:,t])
+                delta_load = p_mw_init * (1 + y[t])
                 self.network.load.p_mw = Series(delta_load)
                 pp.rundcpp(self.network)
-            for t in range(T):
                 x_t_mat.append(self.network.res_bus.va_degree * (np.pi / 180)) # Store in radians
 
             x_t_mat = np.transpose(np.asarray(x_t_mat))
