@@ -309,7 +309,7 @@ class PowerGrid():
         increase the probability for the state estimation to converge to a
         good value (at the expense of taking more time).
 
-        Returns lists of z_x_est, x_est and Hs; the length of each corresponding
+        Returns lists of z_x_ests, x_ests and Hs; the length of each corresponding
         to the number of time steps in z.
 
         Aspects such as the use of dSbr_dV were inspired by pandapower's implementation
@@ -398,7 +398,6 @@ class PowerGrid():
 
             _, min_res, H, x_est, z_x_est = estimator_outcome
 
-            print("min_res", min_res)
             self.Hs.append(H)
             self.x_ests.append(x_est)
             z_x_ests.append(z_x_est)
