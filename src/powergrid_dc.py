@@ -3,6 +3,7 @@ import pandapower as pp
 import pandapower.networks as ppn
 import numpy as np
 import pyomo.environ as pyo
+from pyomo.opt import SolverStatus, TerminationCondition
 from sklearn.linear_model import OrthogonalMatchingPursuit
 from sklearn.decomposition import FastICA
 from pandas import Series
@@ -18,19 +19,21 @@ class AnomalyModels():
     Available models include:
         - least_effort: the aim is to successfully alter a measurement
                         such that it involves minimal "effort"
-            - least_effort_norm_1: aims to minimize the total deviation from natural measurements
+            - least_effort_norm_1: aims to minimize the total deviation from 
+                                   natural measurements
             - least_effort_big_m: aims to minimize the number of nodes by minimizing
-                                    the number of nodes whose non-zero individual measurements
-                                    are within +- M
+                                  the number of nodes whose non-zero individual 
+                                  measurements are within +- M
         - small_ubiquitous: aim to alter a measurement such that the magnitude of
-                            other needed perturbations are minimized, at the expense of
-                            requiring more such perturbations
-        - targeted_*: variants of some models that aim to induce a specific change
+                            other needed perturbations are minimized, at the 
+                            expense of requiring more such perturbations
+        - targeted_*: variants of some models that aim to induce a speciic change
                       in the state vector rather than the measurements.
-        
-        - modal_decomposition: todo
-        - random_matrix: aims to alter a measurement while only knowing the
-                         dimensions of the H matrix and previous measurements
+        - modal_decomposition: aims to perturb a measurement vector while having
+                               no knowledge of the H matrix
+        - random_matrix: aims to perturb the measurement vector while only 
+                         knowing the dimensions of the H matrix and 
+                         previous measurements
 
     Parameters are generally passed through a {name: value} dictionary;
     see the comments for each model for more information.
@@ -44,28 +47,26 @@ class AnomalyModels():
         Contains common code for different variants of the least effort model.
         const_kwargs is expected to include as keys:
         - H, a matrix that is derived from the grid under study
-        - z, generated measurements *for a single time step* that 
-          are to be perturbed
         - fixed: a {index:value} dictionary of the indexes of the target
                  vector the adversary wants to change and by how much. Note that
                  when the 'targeted' key is present, the first element of the
                  (c) vector (i.e. index 0) cannot be modified.
-        - a_bounds, (lower, upper) bounds for elements of a
-        - c_bounds, (lower, upper) bounds for elements of c
-
+        
         It may also include the following:
         - targeted, if included, changes the target from measurements to
-          state variables. This means that k and delta will be used with
+          state variables. This means that k and alpha will be used with
           the c vector instead (with constraints changed accordingly). The
-          return value remains unchanged.
+          return value continues to be the a vector.
+        - a_bounds, (lower, upper) bounds for elements of a (default: [-1000, 1000]) 
+        - c_bounds, (lower, upper) bounds for elements of c (default: [-1000, 1000])
 
-        Common variables include:
+        Common variables (accessible through the variable m) include:
         - a, the attack vector
-        - a_positive and a_negative, components of a used as a workaround for
+        - a_pos and a_neg, components of a used as a workaround for
           the solver not supporting abs()
         - c, the effect of the adjustment of a on the state
         Common constraints include:
-        - a[k] = delta;
+        - a[k] = alpha (or c[k] = alpha for targeted injections);
         - a_bounds[0] <= a[i] <= a_bounds[1] for all i in [0, H.shape(0)[
         - c_bounds[0] <= c[i] <= c_bounds[1] for all i in [0, H.shape(1)[
 
@@ -81,7 +82,8 @@ class AnomalyModels():
         - silence is an attribute which, if present, will stop Gurobi from printing
           to the console. This includes the "Infeasible model!" error message.
 
-        The function returns a vector of perturbations that can then be added to measurements of choice.
+        The function returns a vector of perturbations that can then be added to 
+        measurements of choice.
         A zero vector will be returned if the input model is found to be infeasible.
         """
         m = pyo.ConcreteModel()
@@ -90,12 +92,12 @@ class AnomalyModels():
         vs = var_decls(m, cvs)
         m.a_num = range(cvs["H"].shape[0])
         m.c_num = range(cvs["H"].shape[1])
-        m.a = vs["a"] = pyo.Var(m.a_num, domain=pyo.Reals, bounds=cvs["a_bounds"], initialize=0)
-        m.c = vs["c"] = pyo.Var(m.c_num, domain=pyo.Reals, bounds=cvs["c_bounds"], initialize=0)
+        m.a = vs["a"] = pyo.Var(m.a_num, domain=pyo.Reals, bounds=cvs.get("a_bounds", (-1000, 1000)), initialize=0)
+        m.c = vs["c"] = pyo.Var(m.c_num, domain=pyo.Reals, bounds=cvs.get("c_bounds", (-1000, 1000)), initialize=0)
+        
+        # Workaround for the solver not supporting abs()
         m.a_pos = vs["a_pos"] = pyo.Var(m.a_num, domain=pyo.NonNegativeReals, initialize=0)
         m.a_neg = vs["a_neg"] = pyo.Var(m.a_num, domain=pyo.NonPositiveReals, initialize=0)
-
-        # Workaround for the solver not supporting abs()
         m.abs_a = pyo.ConstraintList()
         for i in m.a_num:
             m.abs_a.add(m.a[i] == m.a_pos[i] + m.a_neg[i]) 
@@ -108,23 +110,26 @@ class AnomalyModels():
             if 0 in cvs["fixed"].keys():
                 del cvs["fixed"][0]
 
-        # default:  a[k] == delta
-        # targeted: c[k] == delta
+        # default:  a[k] == alpha
+        # targeted: c[k] == alpha
         m.targets = pyo.ConstraintList()
-        for k, delta in cvs["fixed"].items():
-            m.targets.add(vs[target][k] == delta)
+        for k, alpha in cvs["fixed"].items():
+            m.targets.add(vs[target][k] == alpha)
 
-        print(type(cvs["H"]), type(m.c))
         adef = lambda i: m.a[i] == (cvs["H"].todense() @ m.c)[i] # Second constraint
         if "targeted" in cvs:
             I_fixed = [0] + list(sorted(cvs["fixed"].keys()))
             I_free = [i for i in range(0, cvs["H"].shape[1]) if i not in I_fixed]
             H_s = cvs["H"][:, I_free]
             H_s_transpose = np.transpose(H_s)
-            B_s = H_s @ np.linalg.inv(H_s_transpose @ H_s) @ H_s_transpose - np.eye(H_s.shape[0])
-            c_aux = [m.c[i] for i in I_fixed]
-            
-            adef = lambda i: np.matmul(B_s, m.a)[i] == (B_s @ cvs["H"][:, I_fixed] @ c_aux)[i]
+            B_s = H_s @ sparse.linalg.inv(H_s_transpose @ H_s) @ H_s_transpose - np.eye(H_s.shape[0])
+            A = np.eye(cvs["H"].shape[1])
+            A = np.delete(A, I_free, 0)
+            c_aux = A @ m.c
+            mat = B_s @ cvs["H"][:, I_fixed].todense() 
+            def adef(i):
+                res = (B_s @ m.a)[i] == (mat @ c_aux)[i]
+                return res if res is not True else pyo.Constraint.Feasible
         
         # default:  a = H*c
         # targeted: B_s * a = y
@@ -139,8 +144,9 @@ class AnomalyModels():
         if "secure" in cvs:
             fixed = cvs["fixed"].keys() if "fixed" in cvs else []
             for si in cvs["secure"]:
-                assert si not in fixed # adversary wants to affect a value they cannot
-                m.inaccessible.add(vs[target][si] == 0)
+                if si in fixed: # adversary wants to affect a value they cannot
+                    return np.zeros(cvs["H"].shape[0]) # infeasible
+                m.inaccessible.add(m.a[si] == 0)
 
         # Additional, optional constraints
         if constraints:
@@ -151,26 +157,41 @@ class AnomalyModels():
         output_flag = "silence" not in cvs
         
         # Use the Gurobi solver
-        optimizer = pyo.SolverFactory("gurobi")
-        status_opti = optimizer.solve(m, tee=output_flag)
+        optimizer = pyo.SolverFactory("gurobi", solver_io="python")
+        
+        num_solutions = cvs.get("multiple_solutions", 0)
+        if num_solutions:
+            optimizer.options["PoolSearchMode"] = 2
+            optimizer.options["PoolSolutions"] = num_solutions
 
-        # Extract elements of a
-        try:
-            least_effort_a = [pyo.value(m.a[i]) for i in m.a_num]
-        except AttributeError:
-            # Infeasible model, so return zero vector
-            if "silence" not in cvs:
-                print("Infeasible model!")
-            return np.zeros([cvs["H"].shape[1], 1])
+        results = optimizer.solve(m, tee=output_flag)
 
-        # a for a single point in time
-        least_effort_a = np.asarray(least_effort_a)
+        # Extract elements of a if successful
+        if (results.solver.status == SolverStatus.ok) and (results.solver.termination_condition == TerminationCondition.optimal):
+            solutions = optimizer._solver_model.SolCount
+            if num_solutions and solutions > 1:
+                xs = []
+                for s in range(solutions):
+                    optimizer._solver_model.params.SolutionNumber = s
+                    x=np.asarray(optimizer._solver_model.getAttr("Xn"))
+                    xs.append(x[:len(m.a_num)])
+                return xs
+            else:
+                a_output = np.asarray([pyo.value(m.a[i]) for i in m.a_num])
+                return a_output # Injection vector for a single time step
+        elif (results.solver.termination_condition == TerminationCondition.infeasible):
+            print("Infeasible!")
+        else:
+            print(f"Error! Solver status: {results.solver.status}, Termination condition: {results.termination_condition}")
 
-        return least_effort_a
+        # Return zero vector if not successful
+        a_zero = np.zeros(cvs["H"].shape[0])
+        return a_zero
 
     def least_effort_norm_1(**const_kwargs):
         """
-        See least_effort_general for the expected contents of const_kwargs.
+        const_kwargs is expected to contain "H" and "fixed"; see
+        least_effort_general for more information.
         """
 
         def constraints(m, _cvs):
@@ -188,11 +209,13 @@ class AnomalyModels():
 
     def least_effort_big_m(**const_kwargs):
         """
-        See least_effort_general for the expected contents of const_kwargs.
-        In addition, an integer parameter M is expected, which gives constraints
-        similar to bounds_a; the difference being that the bounds given by M is 
-        also dependent on binary values, where there is one such value for 
-        each measurement and the sum of which is the target of minimization.
+        const_kwargs is expected to contain "H" and "fixed"; see
+        least_effort_general for more information.
+        In addition, an integer parameter M can be given (default value: 1000)
+        which gives constraints similar to bounds_a; the difference being that 
+        the bounds given by M are also dependent on binary values, where there 
+        is one such value for  each measurement and the sum of which is the 
+        target of minimization.
         """
         ys = const_kwargs["H"].shape[0]
 
@@ -201,14 +224,14 @@ class AnomalyModels():
             m.y = vs["y"] = pyo.Var(range(cvs["H"].shape[0]), domain=pyo.Binary, initialize=0)
             return vs
             
-
         # -y[i]*M <= a[i] <= y[i]*M
-        def constraints(m, _cvs):
+        def constraints(m, cvs):
             m.bigM_bounds = pyo.ConstraintList()
+            M = cvs.get("M", 1000)
             
             for i in range(0, ys):
-                m.bigM_bounds.add(m.a[i] <= m.y[i] * _cvs["M"])
-                m.bigM_bounds.add(m.a[i] >= -m.y[i] * _cvs["M"])
+                m.bigM_bounds.add(m.a[i] <= m.y[i] * M)
+                m.bigM_bounds.add(m.a[i] >= -m.y[i] * M)
                 
             m.nonzero_y = pyo.Constraint(expr = sum(m.y[i] for i in range(ys)) >= 1)
             m.nonzero_a = pyo.Constraint(expr = sum(m.a_pos[i] - m.a_neg[i] for i in m.a_num) >= 1e-1)
@@ -252,7 +275,7 @@ class AnomalyModels():
         I_fixed = [0] + [i for i in sorted(cvs["fixed"].keys()) if i != 0]
         I_free = [i for i in I if i not in I_fixed]
 
-        H_s = cvs["H"][:, I_free]
+        H_s = cvs["H"][:, I_free].todense()
         H_s_transpose = np.transpose(H_s)
         B_s = H_s @ np.linalg.inv(H_s_transpose @ H_s) @ H_s_transpose - np.eye(H_s.shape[0])
         c = np.zeros((cvs["H"].shape[1],))
@@ -260,23 +283,23 @@ class AnomalyModels():
             c[i] = cvs["fixed"][i]
         y = B_s @ cvs["H"][:, I_fixed] @ c[I_fixed]
 
-        H_t = np.transpose(cvs["H"][:, 1:])
-        possible_as = [] # [(# of non-zero elements, a)]
+        H_t = np.transpose(cvs["H"][:, 1:]).todense()
         for n in range(1, cvs["H"].shape[0] + 1):
             # Bs*a=y, solve for a where cardinality(a) = n_nonzero_coefs
             omp = OrthogonalMatchingPursuit(n_nonzero_coefs=n, normalize=False)
+            y = np.asarray(list(y)).flatten()
             omp.fit(B_s, y)
             a = omp.coef_
             # a = H*c => c = (H^T * H)^(-1) * H^T * a
             resulting_c = np.linalg.inv(H_t @ cvs["H"][:, 1:]) @ H_t @ a
-            resulting_c = np.hstack((0, resulting_c))
+            resulting_c = np.asarray(list(resulting_c)).flatten()
+            resulting_c = np.hstack((0, resulting_c.reshape(-1)))
 
-            # Reject zero vectors
             if np.max(np.abs(c[I_fixed] - resulting_c[I_fixed])) < 1e-4:
-                break
-            possible_as.append((n, a))
-
-        return possible_as
+                return a
+                
+        # Infeasible
+        return np.zeros((cvs["H"].shape[0],))
 
     def small_ubiquitous(**const_kwargs):
         """
@@ -299,52 +322,96 @@ class AnomalyModels():
         - fixed: a {index:value} dictionary of the components of the state
                  vector c the adversary wants to change and by how much. Note that
                  the first state variable (index 0) cannot be modified.
+
+        Note that singular value decomposition is used instead of the solver
+        as it is more efficient.
         """
         
         I_fixed = [0] + list(sorted(cvs["fixed"].keys()))
         I_free = [i for i in range(0, cvs["H"].shape[1]) if i not in I_fixed]
         H_s = cvs["H"][:, I_free]
         H_s_transpose = np.transpose(H_s)
-        B_s = H_s @ np.linalg.inv(H_s_transpose @ H_s) @ H_s_transpose - np.eye(H_s.shape[0])
+        B_s = H_s @ sparse.linalg.inv(H_s_transpose @ H_s) @ H_s_transpose - np.eye(H_s.shape[0])
         c = np.zeros((cvs["H"].shape[1],))
         for i in I_fixed[1:]:
             c[i] = cvs["fixed"][i]
         y = B_s @ cvs["H"][:, I_fixed] @ c[I_fixed]
 
         bsr = np.linalg.matrix_rank(B_s)
-        u,s,v = np.linalg.svd(B_s)
-        a = v[:, 0:bsr] @ np.linalg.inv(np.diag(s[0:bsr])) 
-        a = a @ u[:, 0:bsr].transpose() @ y
-        return a
+        try:
+            u,s,v = sparse.linalg.svds(B_s, k=bsr)
+        except np.linalg.LinAlgError: # e.g. did not converge
+            return np.zeros(cvs["H"].shape[0])
+        a = np.transpose(v) @ sparse.linalg.inv(sparse.diags(s)) @ np.transpose(u) @ np.transpose(y)
+        b = np.asarray(list(a)).flatten() # (20,1) => (20,)
+        return b
 
-    def modal_decomposition(z_t, error_tolerance=1e-4):
+    def modal_decomposition(**cvs):
         """
-        WIP.
         Uses Individual Component Analysis (ICA) to attempt to create an
         injection vector. Only measurements for a single time step is used;
         hence, the return value is not the injection vector itself but rather
         the (now perturbed) input measurements.
 
-        If the attack is deemed infeasible, False is returned.
+        Note that the injected values are sampled from a zero-mean normal 
+        distribution with standard deviation 1.
+
+        If the attack is deemed infeasible, a zero-vector is returned.
 
         Required parameters:
-        z_t: measurements for a single time step, as a column vector (e.g. z[:, 1])
+        t: the timestamp of the measurement for which a perturbation is
+             desired.
+        Z: a matrix of measurements for n time steps such that n >= t.
+             Measurements for time steps >= t will be ignored.
+
+        Optional parameters:
+        T: the max size of the rolling window. By default, this is
+           defined as z[0].shape[0] (== H.shape[0]).
+        n: n_components (default: find lowest iteratively)
+        f: ICA function to use (one of ["logcosh", "exp", "cube"]; default: find best iteratively)
+        sigma: determines the size of the covariance matrix 
+               (and hence the injection noise). The default value is 1.
+        error_tolerance: threshold for when the model is considered to be applicable.
+                         The default value is 1e-4.
         """
-        z = z_t.reshape((-1, 1))
-        ica = FastICA(n_components=None, random_state=0,whiten='unit-variance', fun='logcosh')
-        y = ica.fit_transform(z)
-        G = ica.mixing_
+        error_tolerance = cvs.get("error_tolerance", 1e-4)
+        T = cvs.get("T", 2 * cvs["Z"][0].shape[0])
+        t = cvs["t"]
+        Z = cvs["Z"][:, t - T:t] 
+        sigma_2 = cvs.get("sigma", 1)
 
-        # Check for feasibility
-        assert np.max(np.abs(z - (np.dot(y, G.T) + ica.mean_))) < error_tolerance
+        # Load parameters (default: determine best)
+        nr = cvs.get("n", range(1, Z.shape[0]+1))
+        if type(nr) == type(1) or nr is None:
+            nr = [nr]
+        fr = cvs.get("f", ["logcosh", "exp", "cube"])
+        if type(fr) == type("str"):
+            fr = [fr]
 
-        sigma_2 = 0.00001 # to be revisited
-        mean = np.zeros(y.shape[0])
-        cov = np.eye(y.shape[0]) * sigma_2
-        delta_y = np.random.multivariate_normal(mean, cov).reshape((-1, 1))
-        z_perturbed = z + np.dot(y + delta_y, G.T) + ica.mean_
+        min_deviation = [-1, -1, 1e100] # (G, y, deviation) 
 
-        return z_perturbed
+        for n in nr:
+            for f in fr:
+                ica = FastICA(n_components=n, random_state=0, whiten='unit-variance', fun=f)
+                y = ica.fit_transform(np.transpose(Z)) # fit_transform takes as argument (n_samples, n_features))
+                G = ica.mixing_
+                deviation = np.max(np.abs(Z - (G @ y.T) - ica.mean_.reshape((-1,1))))
+                if deviation < min_deviation[2]:
+                    min_deviation = [G, y, deviation]
+
+        if min_deviation[2] > error_tolerance:
+            print("Infeasible!")
+            return np.zeros((Z.shape[0], 1))
+
+        G, y = min_deviation[:2]
+
+        delta_y = np.zeros(y.shape[1])
+        mean = np.zeros(delta_y.shape[0])
+        cov = np.eye(delta_y.shape[0]) * sigma_2
+        delta_y = np.random.multivariate_normal(mean, cov**2)
+
+        a = G @ (y[-1,:] + delta_y)
+        return a
 
     def random_matrix(**cvs):
         """
@@ -353,43 +420,77 @@ class AnomalyModels():
         (i.e. the adversary only has access to the dimensions of H).
 
         Required parameters:
-        - H, a matrix that is derived from the grid under study.
+        - H: a matrix that is derived from the grid under study.
              Note that only the dimensions of H are used.
-        - T, the max size of the rolling window (e.g. 4*cvs["H"].shape[1])
-        - Z, a matrix of measurements for n time stepssuch that n > T
-        - fixed: a {index:value} dictionary of the components of the state
-                 vector c the adversary wants to change and by how much. Note that
-                 the first state variable (index 0) cannot be modified.
+        - t: the timestamp of the measurement for which a perturbation is
+             desired.
+        - Z: a matrix of measurements for n time steps such that n >= t-1 > T.
+             Measurements for time steps >= t will be ignored.
+        - state_noise: factor affecting noise introduced to the state vector; see PowerGrid.
+
+        Optional parameters:
+        - T, the max size of the rolling window (default: 10 * H.shape[1]).
+        - tau: factor affecting the injection vector (default: 0.3)
+        - scenario: parameter that determines how the injection vector is determined
+                    (can be one of ["1a", "1b", "2"]; default: "2")
         """
 
-        cvs["fixed"][0] = 0
-
-        T = 40 * cvs["H"].shape[1] # Default value
-        if "T" in cvs:
-            T = cvs["T"] 
+        T = cvs.get("T", 10 * cvs["H"].shape[1]) 
 
         # Ensure there are enough measurements
         assert cvs["t"] > T 
-        assert cvs["Z"].shape[1] >= cvs["t"]
+        assert cvs["Z"].shape[1] >= cvs["t"] - 1 # Exclude the measurement to be tampered with
+
+        # Fetch the rest of the arguments
+        tau = cvs.get("tau", 0.3)
+        scenario = str(cvs.get("scenario", "2"))
+        noise = cvs["state_noise"]
 
         # Grab the T most recent sets of measurements
         Z = cvs["Z"][:, cvs["t"] - T: cvs["t"]]
 
+        snapshots = Z.shape[1]
 
-        Z_bar = np.mean(Z, axis=1) / (Z.shape[1] - 1)
+        Z_mean = np.sum(Z, axis=1) / (snapshots - 1)
 
-        lst = []
-        for i in range(Z.shape[1]):
-            lst.append(np.outer(Z[:, i] - Z_bar, Z[:, i] - Z_bar))
+        s = 0
+        for i in range(snapshots):
+            s += np.outer(Z[:, i] - Z_mean, Z[:, i] - Z_mean)
         
-        cov = sum(lst) / (Z.shape[1] - 1)
-
-        u, _s, _v = np.linalg.svd(cov)
-        c = np.zeros((cvs["H"].shape[1], 1))  # constant
-        for k, delta in cvs["fixed"].items():
-            c[k] = delta
+        sigma_z = s / (snapshots - 1)
         
-        a = u[:, :cvs["H"].shape[1]] @ c # for a single time t
+        lambdas, eigenvectors = np.linalg.eigh(sigma_z)
+
+        p = Z.shape[0] / snapshots # ratio of #measurements over #snapshots
+        N = lambdas.shape[0]
+
+        def mu(i):
+            return (lambdas[i] + 1 - p + np.sqrt((lambdas[i] + 1 - p)**2 - 4 * lambdas[i])
+                      )/2 - 1
+
+        def omega(i, _mu=None):
+            if not _mu: # optimization possible if mu is computed beforehand
+                _mu = mu(i)
+            return (1 - p/_mu**2)/ (1 + p/_mu)
+ 
+        a = 0
+
+        if scenario in ("1a", "1b"):
+            if scenario == "1a": # Use the smallest eigenvalue
+                i = np.argmin(lambdas)
+            else: # Use the largest eigenvalue
+                i = np.argmax(lambdas)
+            _mu = mu(i)
+            c_i = np.sqrt(tau/(noise**2 * omega(i, _mu)/_mu))
+            a = eigenvectors[:,i] * c_i
+        elif scenario == "2": # Default
+            c = []
+            N = lambdas.shape[0]
+            for i in range(N):
+                _mu = mu(i)
+                c.append(np.sqrt(tau/(noise**2 * N*omega(i, _mu)/_mu)))
+            c = np.asarray(c)
+            a = eigenvectors @ c
 
         # a is a vector of single-element vectors
         return a.reshape(-1)
@@ -402,28 +503,38 @@ class PowerGrid():
     """
     # These variables are created upon initialization, and could be considered
     # constants. They are set through the given input parameters.
-    network            = None # 'network_id'
-    H                  = None # 'network_id'
-    measurement_factor = 1e-4 # 'measurement_factor', optional
-    noise_factor       = 1e-3 # 'noise_factor', optional
-    anomaly_threshold  = 3    # 'anomaly_threshold', optional
+    network                  = None # 'network_id'
+    H                        = None # 'network_id'
+    state_noise_factor       = 1e-3 # 'state_noise_factor', optional
+    measurement_noise_factor = 1e-2 # 'measurement_noise_factor', optional
+    anomaly_threshold        = 3    # 'anomaly_threshold', optional
     
     # These variables are updated (and overwritten) upon calling the given
     # functions.
     data_generation_strategy = None # create_measurements()
     z_buffer                 = None # create_measurements()
-    cov                      = None # create_measurements(); used when generating noise and normalizing residuals
+    cov                      = None # create_measurements(); used when generating noise
+    cov_noise                = None # create_measurements(); used when generating noise and normalizing residuals
     x_est                    = None # estimate_state()
-    residuals_normalized     = None # calculate_residue()
+    residuals_normalized     = None # calculate_normalized_residuals()
 
-    def __init__(self, network_id, measurement_factor=None, noise_factor=None, 
-                 anomaly_threshold=None):
+    def __init__(self, network_id, state_noise_factor=None, measurement_noise_factor=None, 
+                 anomaly_threshold=None, double_measurements=False):
         """
-        Available networks include:
-        - "IEEE X", where X is one of [14, 30, 57, 118];
-        - "Illinois 200", or simply 200;
-        - "PEGASE 1354", or 1354;
-        - "RTE 2848", or 2848;
+        network_id can have the format "{prefix}{number}", {number} or "{number}",
+        where prefix is one of ["IEEE ", "Illinois ", "PEGASE ", "RTE "].
+        Since there does not appear to be any overlap between test cases, the 
+        prefix has no functional purpose (aside from giving more context to the user).
+        The number (corresponding to the number of nodes) can be one of:
+        [4, 5, 6, 9, 11, 14, 24, 29, 30, 33, 39, 57, 89, 118, 145,
+         200, 300, 1354, 2224, 2848, 3120, 6470, 6495, 9515, 9241].
+
+        Some cases have special names, including as "iceland" (118 nodes, but
+        different from IEEE 118), "GBnetwork" (2224 nodes) and 
+        "GBreducednetwork" (29 nodes). Moreover, "IEEE30" and "IEEE 30" are
+        based on the same case, but are slightly different due to having
+        different origins. The former is only chosen if the network_id is
+        exactly "IEEE30".
 
         The selected network will be loaded and stored in self.network.
         """
@@ -435,16 +546,40 @@ class PowerGrid():
             prefix = list(p for p in accepted_prefixes if p in network_id)
             if prefix:
                 prefix = prefix[0]
-                network_id = network_id[network_id.index(prefix)+len(prefix):]
-
+                network_id = network_id[network_id.index(prefix) + len(prefix):]
         cases = {
+            "4": ppn.case4gs,
+            "4gs": ppn.case4gs,
+            "5": ppn.case5,
+            "6": ppn.case6ww,
+            "6ww": ppn.case6ww,
+            "9": ppn.case9,
+            "11": ppn.case11_iwamoto,
             "14": ppn.case14,
-            "30": ppn.case30,
+            "24": ppn.case24_ieee_rts,
+            "29": ppn.GBreducednetwork,
+            "GBreducednetwork": ppn.GBreducednetwork,
+            "30": ppn.case30,          # These two are based on the same case, but have
+            "IEEE30": ppn.case_ieee30, # different origins (PYPOWER and MATPOWER)
+            "33": ppn.case33bw,
+            "39": ppn.case39,
             "57": ppn.case57,
+            "89": ppn.case89pegase,
             "118": ppn.case118,
+            "iceland": ppn.iceland, # 118 nodes, but different from case118
+            "145": ppn.case145,
             "200": ppn.case_illinois200,
+            "300": ppn.case300,
             "1354": ppn.case1354pegase,
+            "1888": ppn.case1888rte,
+            "2224": ppn.GBnetwork,
+            "GBnetwork": ppn.GBnetwork,
             "2848": ppn.case2848rte,
+            "3120": ppn.case3120sp,
+            "6470": ppn.case6470rte,
+            "6495": ppn.case6495rte,
+            "6515": ppn.case6515rte,
+            "9241": ppn.case9241pegase
         }
 
         if not network_id in cases:
@@ -462,37 +597,44 @@ class PowerGrid():
         line = self.network.line
         rows = line.shape[0]
         connections = rows + self.network.trafo.shape[0]
-        self.H = np.zeros((connections, self.network.bus.shape[0]))
+        step = 1 + int(double_measurements)
+        self.H = np.zeros((step*connections, self.network.bus.shape[0]))
 
         # Some connections are found in {from, to}_bus, others are found in
         # trafo.{hv, lv}_bus.
+        
         for from_index, to_index, from_bus, to_bus, j in (
             (0, rows, 
                 line.from_bus.values, line.to_bus.values, 
                 lambda i: i), 
-            (rows+1, connections, 
+            (rows, connections, 
                 self.network.trafo.hv_bus.values, self.network.trafo.lv_bus.values,
                 lambda i: i - rows)
             ):
-            
             for i in range(from_index, to_index):
                 from_j = from_bus[j(i)]
                 to_j = to_bus[j(i)]
-                power_flow = 1 / A_real[from_j, to_j]
-                self.H[i, from_j] = power_flow
-                self.H[i, to_j]  = -power_flow
+                power_flow = A_real[from_j, to_j]
+                # from flows
+                self.H[step*i, from_j] = -power_flow
+                self.H[step*i, to_j]  = power_flow
+                # to flows
+                if double_measurements:
+                    power_flow = A_real[to_j, from_j]
+                    self.H[step*i+1, to_j] = -power_flow
+                    self.H[step*i+1, from_j]  = power_flow
 
         self.H = sparse.csr_matrix(self.H)
 
-        if noise_factor:
-            self.noise_factor = noise_factor
-        if measurement_factor:
-            self.measurement_factor = measurement_factor
+        if measurement_noise_factor:
+            self.measurement_noise_factor = measurement_noise_factor
+        if state_noise_factor:
+            self.state_noise_factor = state_noise_factor
         if anomaly_threshold:
             self.anomaly_threshold = anomaly_threshold
         
 
-    def create_measurements(self, T, data_generation_strategy, env_noise=True):
+    def create_measurements(self, T, data_generation_strategy, env_noise=True, OU=None):
         """
         Generates T measurements according to
             z = H*x + n
@@ -514,23 +656,67 @@ class PowerGrid():
             x_base = x_temp.to_numpy()
             # Dx ~ N(0,Cov_Mat)
             mean = np.zeros(x_base.shape)
-            self.cov = np.eye(x_base.shape[0]) * self.measurement_factor
+            self.cov = np.eye(x_base.shape[0]) * self.state_noise_factor
             delta_x_mat = np.transpose(np.random.multivariate_normal(mean, self.cov**2, size=T))
             x_base_mat = np.repeat(x_base.reshape((x_base.shape[0], -1)), T, axis=1)
             x_t_mat = x_base_mat + delta_x_mat
+            x_t_mat[0, :] = 0
 
         elif data_generation_strategy == 2:
+            """
+            Jesper Franke, "Short introduction to python", Potsdam Institute for Climate Impact Research
+            https://www.pik-potsdam.de/members/franke/lecture-sose-2016/introduction-to-python.pdf
+            """
+            
             x_t = x_temp.to_numpy()
             x_t_mat = x_t.reshape((x_t.shape[0], -1))
-            p_mw = self.network.load.p_mw
-            mean = np.zeros(p_mw.shape) * self.measurement_factor
-            self.cov = np.eye(p_mw.shape[0])    
-            for t in range(1, T):
-                delta_load = np.random.multivariate_normal(mean, self.cov**2)
-                p_mw.add(Series(delta_load)) 
+            p_mw_init = self.network.load.p_mw.values.copy()
+
+            
+            if OU:
+                theta, mu, sigma = OU
+            else:
+                # Comments based on article by Diego Barba (May 3, 2022)
+                # https://towardsdatascience.com/stochastic-processes-simulation-the-ornstein-uhlenbeck-process-e8bff820f3
+                theta = np.abs(np.random.normal(0.001, 0.01)) # mean-reversion
+                mu = 0 # asymptotic mean
+                sigma = np.abs(np.random.normal(0.005, 0.01)) # random scale
+
+            t = np.linspace(0, T, T)
+            dt = np.mean(np.diff(t))
+            y = np.zeros(T)
+            y[0] = p_mw_init[0] # ?
+
+            drift = lambda y,t: theta * (mu - y)
+            diffusion = lambda _y, _t: sigma
+            #noise = np.random.normal(loc=0, scale=1.0, size=T) * np.sqrt(dt)
+            noise = np.random.normal(0, self.state_noise_factor**2, T) * np.sqrt(dt)
+
+            for i in range(1, T):
+                y[i] = y[i-1] + drift(y[i-1], i*dt)*dt + diffusion(y[i-1], i*dt) * noise[i]
+
+
+            OU_proc = np.asarray(OU_proc)
+            x_t_mat = []
+            for t in range(T):
+                delta_load = p_mw_init * (1+OU_proc[:,t])
+                self.network.load.p_mw = Series(delta_load)
                 pp.rundcpp(self.network)
-                x_t = x_temp.to_numpy().reshape((x_t.shape[0], -1))
-                x_t_mat = np.hstack((x_t_mat, x_t))
+            for t in range(T):
+                x_t_mat.append(self.network.res_bus.va_degree * (np.pi / 180)) # Store in radians
+
+            x_t_mat = np.transpose(np.asarray(x_t_mat))
+
+            self.network.load.p_mw = p_mw_init
+
+            #mean = np.zeros(p_mw.shape) * self.state_noise_factor
+            #self.cov = np.eye(p_mw.shape[0])    
+            #for t in range(1, T):
+            #    delta_load = np.random.multivariate_normal(mean, self.cov**2)
+            #    p_mw.add(Series(delta_load)) 
+            #    pp.rundcpp(self.network)
+            #    x_t = x_temp.to_numpy().reshape((x_t.shape[0], -1))
+            #    x_t_mat = np.hstack((x_t_mat, x_t))
         else:
             raise ValueError(f"Invalid data_generation_strategy: {data_generation_strategy}")
 
@@ -538,8 +724,8 @@ class PowerGrid():
 
         #z_t = H @ x_t + noise, where @ is infix for np.matmul
         mean = np.zeros(self.H.shape[0])
-        self.cov_noise = np.eye(self.H.shape[0]) * self.noise_factor
-        noise_mat = np.transpose(np.random.multivariate_normal(mean, self.cov_noise, size=T))
+        self.cov_noise = np.eye(self.H.shape[0]) * self.measurement_noise_factor
+        noise_mat = np.transpose(np.random.multivariate_normal(mean, self.cov_noise**2, size=T))
         self.W = np.linalg.inv(self.cov_noise**2) # Used in estimate_state()
         z_t_mat = self.H @ x_t_mat
         if env_noise:
@@ -564,6 +750,9 @@ class PowerGrid():
         # self.x_est = np.linalg.inv(H_est_transpose @ self.W @ H_est) @ H_est_transpose @ self.W @ z
         self.x_est = sparse.linalg.spsolve(H_est_transpose @ self.W @ H_est, H_est_transpose @ self.W @ z)
 
+        if len(self.x_est.shape) == 1: # e.g. (13,) instead of (13, 1)
+            self.x_est = self.x_est.reshape(-1, 1)
+
         # Prepend zeroes as the first measurement, since the latter ones are
         # measured relative to it.
         self.x_est = np.vstack((np.zeros((self.x_est.shape[1])), self.x_est))
@@ -584,16 +773,18 @@ class PowerGrid():
         x_hat = self._load_var("x_est", x_est, err_msg + "x_est")
 
         r = z - self.H @ x_hat
-        
+
         # If e ~ N(0, self.cov_noise**2), then normalized_residuals ~ N(0, omega)
         Ht = np.transpose(self.H[:,1:])
-        omega = self.cov_noise**2 - self.H[:,1:] @ np.linalg.inv(Ht @ self.W @ self.H[:,1:]) @ Ht
+        omega = self.cov_noise**2 - (self.H[:,1:] @ np.linalg.inv(Ht @ self.W @ self.H[:,1:]) @ Ht)
+        omega[abs(omega) < 1e-8] = 1e-8
         self.residuals_normalized = []
+
         for i in range(0, r.shape[1]):
             v = np.abs(r[:,i]) / np.sqrt(np.abs(np.diag(omega)))
             self.residuals_normalized.append(v)
         
-        self.residuals_normalized = np.asarray(self.residuals_normalized)
+        self.residuals_normalized = np.transpose(np.asarray(self.residuals_normalized))
 
         return self.residuals_normalized
 
@@ -627,7 +818,7 @@ class PowerGrid():
         Helper function that:
             - if 'arg' is None, returns the value stored in the attribute given
               by 'default_key': getattr(self, default_key)
-            - otherwise, 'arg' is returned the attribute is set to this value.
+            - otherwise, 'arg' is returned and the attribute is set to this value.
         If 'arg' is None and the attribute does not have a value (or does not exist),
         then a ValueError exception is thrown.
         """
