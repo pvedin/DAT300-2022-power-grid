@@ -10,7 +10,7 @@ def println(*args, **kwargs):
 def print_anomalies(net, r):
     anomalies = net.check_for_anomalies(r)
     # (row, col) == (measurement_index, timestamp)
-    println("Anomalies:", [(f"ts {i[0]} index {i[1]}", r[i[0], i[1]]) for i in anomalies])
+    println("Anomalies:", [(f"ts {i[1]} index {i[0]}", r[i[0], i[1]]) for i in anomalies])
     print(len(anomalies))
 
 def test_blueprint():
@@ -49,14 +49,14 @@ def test_demo():
         "a_bounds": (-1000, 1000),
         "c_bounds": (-1000, 1000),
     }
-    config["fixed"][1] = abs(z[1, 1]) * 0.2
+    config["fixed"][1] = abs(z[1, 1]) * 0.1
     a = AnomalyModels.least_effort_norm_1(**config)
     println("Attack vector:", a.transpose())
     z[:, 1] += a.transpose()
     
     # Naively try to tamper with the last time step
     a = np.zeros(z[:, 1].shape)
-    a[1] = abs(z[1, 2]) * 0.2
+    a[1] = abs(z[1, 2]) * 0.1
     z[:, 2] += a
     println(z)
 
@@ -198,27 +198,31 @@ def test_matching_pursuit():
 def test_modal_decomposition():
     print("Testing: modal decomposition")
     net = PowerGrid(14)
-    z = net.create_measurements(2, 1)
-    z = z.repeat(2, axis=1)
+    z = net.create_measurements(46, 1)
+    cfg = {
+        "Z": z,
+        "T": 40,
+        "t": 44,
+    }
     try:
-        z_a1 = AnomalyModels.modal_decomposition(z[:, 2])
-        print("ts 2 ok!")
-        z_a2 = AnomalyModels.modal_decomposition(z[:, 3])
-        print("ts 3 ok!")
+        a = AnomalyModels.modal_decomposition(**cfg)
     except AssertionError:
         println("Infeasible!", z)
         exit()
+
+    print(a.shape)
         
-    z[:, 2] = z_a1
-    z[:, 3] = z_a2
-    println("z:", z)
+    z[:, 44] += a
+    println("z:", z[:, 43:46])
     x_est = net.estimate_state(z)
-    println("x_est:", x_est)
+    println("x_est:", x_est[:, 43:46])
     r = net.calculate_normalized_residuals()
+    print("r:", r[:, 43:46])
     print_anomalies(net, r)
 
 def test_random_matrix():
     print("Testing: random matrix")
+    np.random.seed(1)
     net = PowerGrid(14)
     z = net.create_measurements(1000, 1)
     print(z.shape)
@@ -226,13 +230,15 @@ def test_random_matrix():
         "H": net.H,
         "Z": z,
         "t": 750,
-        "fixed": {2:-100}
+        "T": 700,
+        "tau": 10,
+        "state_noise": net.state_noise_factor
     }
 
     a = AnomalyModels.random_matrix(**config)
     println(a)
-    println(type(z[:,750]), z[:,750].shape, z[:,750])
     z[:,750] += a
+    print("Measurements", z[:, 749:752])
     x_est = net.estimate_state(z)
     println("Estimated states:", x_est[:,749:752])
     r = net.calculate_normalized_residuals()
@@ -364,10 +370,15 @@ def test_targeted_small_ubiquitous():
     println("Normalized residuals:", r, r.shape)
     print_anomalies(net, r)
 
+def test_OU():
+    net = PowerGrid(14)
+    z = net.create_measurements(1,2)
+
 if __name__ == "__main__":
     np.set_printoptions(edgeitems=10, linewidth=180)
 
-    test_norm_1()
+    #test_demo()
+    #test_norm_1()
     #test_big_m()
     #test_targeted_least_effort()
     #test_small_ubiquitous()
@@ -377,5 +388,7 @@ if __name__ == "__main__":
     #test_random_matrix()
     #test_for_anomalies()
     #test_sensor_count()
+
+    test_OU()
     
 
