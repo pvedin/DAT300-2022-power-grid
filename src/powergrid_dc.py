@@ -326,12 +326,17 @@ class AnomalyModels():
         Note that singular value decomposition is used instead of the solver
         as it is more efficient.
         """
-        
+        if 0 in cvs["fixed"]:
+            return np.zeros(cvs["H"].shape[0])
+
         I_fixed = [0] + list(sorted(cvs["fixed"].keys()))
         I_free = [i for i in range(0, cvs["H"].shape[1]) if i not in I_fixed]
         H_s = cvs["H"][:, I_free]
         H_s_transpose = np.transpose(H_s)
-        B_s = H_s @ sparse.linalg.inv(H_s_transpose @ H_s) @ H_s_transpose - np.eye(H_s.shape[0])
+        B_s = (H_s @ sparse.linalg.inv(H_s_transpose @ H_s))
+        if B_s.ndim == 1: # e.g. (4,) => (4, 1)
+            B_s = B_s.reshape(-1, 1)
+        B_s = (B_s @ H_s_transpose) - np.eye(H_s.shape[0])
         c = np.zeros((cvs["H"].shape[1],))
         for i in I_fixed[1:]:
             c[i] = cvs["fixed"][i]
@@ -459,7 +464,11 @@ class AnomalyModels():
         
         sigma_z = s / (snapshots - 1)
         
-        lambdas, eigenvectors = np.linalg.eigh(sigma_z)
+        try:
+            lambdas, eigenvectors = np.linalg.eigh(sigma_z)
+        except np.linalg.LinAlgError:
+            print("Infeasible!")
+            return np.zeros(cvs["H"].shape[0])
 
         p = Z.shape[0] / snapshots # ratio of #measurements over #snapshots
         N = lambdas.shape[0]

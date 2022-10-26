@@ -162,7 +162,7 @@ def demo_norm_1():
     print(sensor_freq_1)
     print(sensor_freq_2)
 
-    td = {
+    dd = {
         "z": z,
         "z_a": z_a,
         "x_est": x_est,
@@ -177,10 +177,112 @@ def demo_norm_1():
         "sensor_freq_1": sensor_freq_1,
         "sensor_freq_2": sensor_freq_2,
     }
-    pickle_dump("data/dc_norm1_demo", td)
+    pickle_dump("data/demo_norm1", dd)
 
     print("Expected: anomalies only for ts 5-9, different perturbation for ts 25-29")
-    return td
+    return dd
+
+def demo_targeted_small_ubiquitous():
+    print("Demo: targeted_small_ubiquitous")
+    net = PowerGrid(4)
+    z = net.create_measurements(30, 1)
+    z_a = z.copy()
+
+    config = {
+        "H": net.H
+    }
+    aa = []
+
+    # time 0-4:   no injection
+    # time 5-9:   targeted_small_ubiquitous, state 1
+    # time 10-14: no injection
+    # time 15-19: targeted_small_ubiquitous, state 2
+    # time 20-24: no injection
+    # time 25-29: targeted_small_ubiquitous, state 3
+
+    for si in range(3): # for each state
+        for j in range(5, 10):
+            config["fixed"] = {si+1: 0.01*j} # [0.05, 0.09]
+            a = AnomalyModels.targeted_small_ubiquitous(**config)
+            aa.append(a)
+            z_a[:, 10*si + j] += a
+
+    x_est = net.estimate_state(z)
+    x_est_a = net.estimate_state(z_a)
+    r = net.calculate_normalized_residuals(z, x_est)
+    r_a = net.calculate_normalized_residuals(z_a, x_est_a)
+
+    dd = {
+        "z": z,
+        "z_a": z_a,
+        "x_est": x_est,
+        "x_est_a": x_est_a,
+        "r": r,
+        "r_a": r_a
+    }
+
+    pickle_dump("data/demo_targeted_small_ubiquitous", dd)
+
+def demo_random_matrix():
+    print("Demo: random_matrix")
+    net = PowerGrid(4) 
+    z = net.create_measurements(100, 1)
+    z_a = z.copy()
+
+    aa = []
+    config = {
+        "H": net.H, # note that only the dimensions will be used
+        "T": 70,
+        "scenario": "2", # default
+        "tau": 10,
+        # "t": timestep > 70
+        # "Z": z[:t]
+        # "state_noise": 1e-{4,3,2}
+    }
+
+    noise_factors = [5e-4, 1e-3, 2e-3]
+    taus = list(range(5,10)) # [5, 9]
+
+    # 17.5*4 = 70
+    # start from time=70
+    # time 70-74: no injection
+    # time 75-79: random_matrix with state_noise = 1e-4
+    # time 70-74: no injection
+    # time 75-79: random_matrix with state_noise = 1e-3
+    # time 70-74: no injection
+    # time 75-79: random_matrix with state_noise = 1e-2
+
+    i = 0
+    for ts in [range(75,80), range(85,90), range(95,100)]:
+        config["state_noise"] = noise_factors[i]
+        i += 1
+        
+        j = 0
+        for t in ts:
+            config["t"] = t
+            config["Z"] = z[:t]
+            config["tau"] = taus[j]
+            a = AnomalyModels.random_matrix(**config)
+            aa.append(a)
+            z_a[:, t] += a
+            j += 1
+
+    x_est = net.estimate_state(z)
+    x_est_a = net.estimate_state(z_a)
+
+    r = net.calculate_normalized_residuals(z, x_est)
+    r_a = net.calculate_normalized_residuals(z_a, x_est_a)
+
+    dd = {
+        "z": z,
+        "z_a": z_a,
+        "x_est": x_est,
+        "x_est_a": x_est_a,
+        "r": r,
+        "r_a": r_a
+    }
+
+    pickle_dump("data/demo_random_matrix", dd)
 
 def exp_norm1():
     net = PowerGrid(14)
@@ -1024,17 +1126,17 @@ def exp_computational_complexity_double_measurements():
     return tds
 
 def targeted_get_fixed(net, k, alpha):
-        lines = net.network.line.shape[0]
-        if k < lines:
-            i1 = net.network.line.from_bus[k]
-            i2 = net.network.line.to_bus[k]
-            if i1 == 0:
-               i1, i2 = i2, i1
-        if k >= lines: # remainder are in network.trafo
-            i1 = net.network.line.from_bus[k - lines]
-            i2 = net.network.line.to_bus[k - lines]
+    lines = net.network.line.shape[0]
+    if k < lines:
+        i1 = net.network.line.from_bus[k]
+        i2 = net.network.line.to_bus[k]
+        if i1 == 0:
+            i1, i2 = i2, i1
+    if k >= lines: # remainder are in network.trafo
+        i1 = net.network.line.from_bus[k - lines]
+        i2 = net.network.line.to_bus[k - lines]
 
-        return {i1: alpha, i2: 0}
+    return {i1: alpha, i2: 0}
 
 def exp_unfolding_risky_sensors_gather(threshold=1e-5):
     iterations = 1000
@@ -1340,8 +1442,5 @@ def exp_norm1_leverage_double():
 if __name__ == "__main__":
     np.set_printoptions(edgeitems=10, linewidth=180)
 
+    demo_random_matrix()
     print()
-
-
-
-
